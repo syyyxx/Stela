@@ -57,16 +57,88 @@ fn an_8_gib_host_gives_the_guest_what_the_parts_leave() {
 }
 
 #[test]
-fn a_16_gib_host_takes_96_mib_per_runner_for_its_window_and_the_heap_target() {
+fn a_16_gib_host_takes_a_sixteenth_for_its_window_and_the_heap_target() {
     let sizes = sizes(free(16), 8, 8).unwrap();
-    // 8 runners' 96 MiB (768 MiB, under a sixteenth's 992 MiB), and each
-    // executor's 2 MiB of its own.
-    assert_eq!(sizes.code.window, 768 * MIB);
-    assert_eq!(sizes.code.bytes, 784 * MIB);
+    // A sixteenth of its 15.5 GiB free (992 MiB, past 8 runners' 96 MiB
+    // each), and each executor's 2 MiB of its own.
+    assert_eq!(sizes.code.window, 992 * MIB);
+    assert_eq!(sizes.code.bytes, 1008 * MIB);
     // The target plus a byte per window byte past 512 MiB: an eighth, the
     // window and 16 MiB per PE are under it, and the guest keeps its room.
-    assert_eq!(sizes.heap, HEAP_TARGET + 256 * MIB);
-    assert!(sizes.guest > 9 * GIB + 512 * MIB);
+    assert_eq!(sizes.heap, HEAP_TARGET + 480 * MIB);
+    assert!(sizes.guest > 9 * GIB);
+}
+
+/// The guest's working set of code does not shrink with its PEs, so a host
+/// whose guest keeps its room takes a sixteenth of its free RAM for the
+/// window whatever its PEs, with the heap on its target for that window:
+/// 2 PEs took 192 MiB and 4 took 384 MiB on any host.
+#[test]
+fn the_window_follows_the_hosts_memory_not_its_pes() {
+    for (installed, window) in [(16, 992), (32, 1984), (48, 2048), (128, 2048)] {
+        for runners in [1, 2, 4, 6, 8, 12] {
+            let free = free(installed);
+            let sizes = sizes(free, runners, runners).unwrap();
+            assert_eq!(
+                sizes.code.window,
+                window * MIB,
+                "{installed} GiB, {runners} PEs"
+            );
+            let shared = shared_heap(free, runners, sizes.code.window);
+            assert_eq!(
+                sizes.heap,
+                shared.max(heap_target(shared, sizes.code.window))
+            );
+            assert!(sizes.guest >= GUEST_ROOM, "{installed} GiB, {runners} PEs");
+        }
+    }
+    // An 8 GiB host's guest is under its room: each runner's share, or the
+    // host's where that is less, as before.
+    for (runners, window) in [(2, 192), (4, 384), (8, 496)] {
+        let sizes = sizes(free(8), runners, runners).unwrap();
+        assert_eq!(sizes.code.window, window * MIB, "{runners} PEs");
+    }
+}
+
+/// On hosts between, a window past its runners' share is the largest that
+/// leaves the guest its room with the heap on its target; more RAM never
+/// gives a smaller window.
+#[test]
+fn a_window_past_its_runners_share_leaves_the_guest_its_room() {
+    let roomy = |free: u64, runners: usize, sizes: &Sizes| {
+        let shared = shared_heap(free, runners, sizes.code.window);
+        sizes.guest >= GUEST_ROOM
+            && sizes.heap == shared.max(heap_target(shared, sizes.code.window))
+    };
+    for runners in [1, 2, 4, 8, 16, 24] {
+        let (mut last, mut grown) = (0, 0);
+        for free in (6 * GIB..72 * GIB).step_by(61 * MIB as usize) {
+            let Ok(sizes) = sizes(free, runners, runners) else {
+                continue;
+            };
+            let window = sizes.code.window;
+            assert!(window.is_multiple_of(CODE_ALIGNMENT));
+            assert!(window <= window_share(free), "{runners} PEs, {free}");
+            assert!(window >= last, "{runners} PEs, {free}");
+            last = window;
+            let each = runners as u64 * WINDOW_PER_RUNNER;
+            let per_runner = estimate_within(free, runners, runners, each).unwrap();
+            if window <= per_runner.code.window {
+                continue;
+            }
+            grown += 1;
+            assert!(roomy(free, runners, &sizes), "{runners} PEs, {free}");
+            if window < window_share(free) {
+                let more = estimate_within(free, runners, runners, window + CODE_ALIGNMENT);
+                assert!(
+                    !roomy(free, runners, &more.unwrap()),
+                    "{runners} PEs, {free}"
+                );
+            }
+        }
+        // Up to 16 PEs the share passes each runner's on these hosts.
+        assert_eq!(grown != 0, runners <= 16, "{runners} PEs");
+    }
 }
 
 /// A 12 GiB host with 8 cores (11514 MiB free) takes a 704 MiB window,
@@ -92,8 +164,8 @@ fn a_host_short_of_the_larger_window_falls_back_to_the_smaller() {
         .step_by(16)
         .map(|free| free * MIB)
         .find(|&free| {
-            let large = estimate_with(free, 2, 2, WINDOW_PER_RUNNER).unwrap();
-            let small = estimate_with(free, 2, 2, SMALL_WINDOW_PER_RUNNER).unwrap();
+            let large = estimate_within(free, 2, 2, 2 * WINDOW_PER_RUNNER).unwrap();
+            let small = estimate_within(free, 2, 2, 2 * SMALL_WINDOW_PER_RUNNER).unwrap();
             large.guest < GUEST_FLOOR && small.guest >= GUEST_FLOOR
         })
         .expect("a host the fallback lets boot");
@@ -112,14 +184,15 @@ fn sizes_of(free: u64) -> Sizes {
 #[test]
 fn a_64_gib_host_grows_the_heap_with_its_share_window_and_pes() {
     let sizes = sizes(free(64), 8, 8).unwrap();
-    let heap = free(64) / HEAP_SHARE + HEAP_PER_WINDOW * 768 * MIB + 8 * PE_HEAP;
+    let heap = free(64) / HEAP_SHARE + HEAP_PER_WINDOW * 2048 * MIB + 8 * PE_HEAP;
     assert_eq!(sizes.heap, heap / ALIGNMENT * ALIGNMENT);
     assert!(HEAP_FLOOR < sizes.heap && sizes.heap < HEAP_CEILING);
-    assert_eq!(sizes.code.bytes, 784 * MIB);
-    // Each runner's halves for the guest's 51 GiB, not a 64th.
-    assert_eq!(sizes.pool, 1256 * MIB);
+    // The window's 2 GiB bound, under a sixteenth's 3.9 GiB.
+    assert_eq!(sizes.code.bytes, 2064 * MIB);
+    // Each runner's halves for the guest's 49 GiB, not a 64th.
+    assert_eq!(sizes.pool, 1226 * MIB);
     assert!(sizes.pool < 8 * POOL_PER_RUNNER);
-    assert!(sizes.guest > 50 * GIB);
+    assert!(sizes.guest > 48 * GIB);
 }
 
 /// Heap, code, pool and guest MiB for `runners` PEs at `free` GiB, or None
@@ -129,14 +202,14 @@ fn stelas_share_stops_growing_per_pe_past_what_each_pe_takes() {
     for (runners, free, expected) in [
         (2, 4, None),
         (2, 8, Some([2496, 196, 166, 5334])),
-        (2, 16, Some([3776, 196, 194, 12218])),
-        (2, 30, Some([4064, 196, 236, 26224])),
-        (2, 128, Some([16384, 196, 492, 114000])),
+        (2, 16, Some([4608, 1028, 190, 10558])),
+        (2, 30, Some([5792, 1924, 226, 22778])),
+        (2, 128, Some([16384, 2052, 488, 112148])),
         (8, 4, None),
         (8, 8, Some([2816, 528, 538, 4310])),
-        (8, 16, Some([4352, 784, 762, 10486])),
-        (8, 30, Some([4736, 784, 924, 24276])),
-        (8, 128, Some([16384, 784, 1950, 111954])),
+        (8, 16, Some([4608, 1040, 756, 9980])),
+        (8, 30, Some([5888, 1936, 896, 22000])),
+        (8, 128, Some([16384, 2064, 1936, 110688])),
         (24, 4, None),
         (24, 8, Some([2816, 560, 768, 4048])),
         (24, 16, Some([4608, 1072, 768, 9936])),
@@ -171,17 +244,18 @@ fn stelas_share_stops_growing_per_pe_past_what_each_pe_takes() {
 /// - the 12 GiB VM, `free=11514M heap=3008M code=720M pool=864M
 ///   guest=6922M`: 778 MiB less, to the heap's target;
 /// - the 16 GiB VM, `free=15710M heap=3280M code=992M pool=1032M
-///   guest=10406M`: 586 MiB less, to the heap's target;
+///   guest=10406M`: 998 MiB less, to the heap's target at the window that
+///   boot had;
 /// - the 32 GB PC, `free=30242M heap=3672M code=1040M pool=2836M
-///   guest=22694M`: 1170 MiB more.
+///   guest=22694M`: 1044 MiB less, to a 1888 MiB window and its records.
 #[test]
 fn measured_boots_split_as_expected() {
     for (free, expected) in [
         (7354, [2752, 464, 458, 3680]),
         (HOST_8_GB / MIB, [2768, 480, 476, 3820]),
         (11514, [3940, 720, 710, 6144]),
-        (15710, [4352, 784, 754, 9820]),
-        (30242, [4676, 784, 918, 23864]),
+        (15710, [4560, 992, 750, 9408]),
+        (30242, [5796, 1904, 892, 21650]),
     ] {
         let sizes = sizes(free * MIB, 8, 8).unwrap();
         assert_eq!(
@@ -193,20 +267,21 @@ fn measured_boots_split_as_expected() {
 }
 
 /// Installed GiB and cores to the split, and the guest MiB the sizing of
-/// v0.1.0 gave (8 GiB: +372 at 2 cores, +226 at 4, +16 at 8; 32 GiB: +2990;
-/// 64 GiB: +8160; 128 GiB: +12302). 16 GiB hosts give the heap its target
-/// from the guest instead (-672 at 4, -304 at 8).
+/// v0.1.0 gave (8 GiB: +372 at 2 cores, +226 at 4, +16 at 8; 64 GiB: +302;
+/// 128 GiB: +628). 16 and 32 GiB hosts give the heap its target and the
+/// window the host's share from the guest instead (16 GiB: -1882 at 4
+/// cores, -746 at 8; 32 GiB: -1162).
 #[test]
 fn host_sizes_split_as_expected() {
     for (installed, cores, expected, before) in [
         (8, 2, [2496, 196, 158, 5086], 4714),
         (8, 4, [2688, 392, 284, 4572], 4346),
         (8, 8, [2800, 512, 512, 4112], 4096),
-        (16, 4, [3968, 392, 384, 11128], 11800 - 672),
-        (16, 8, [4352, 784, 756, 9980], 10284 - 304),
-        (32, 8, [4864, 784, 934, 25162], 23920),
-        (64, 8, [8832, 784, 1256, 52616], 49784),
-        (128, 8, [16384, 784, 1904, 107904], 106012),
+        (16, 4, [4576, 1000, 378, 9918], 11800 - 1882),
+        (16, 8, [4576, 1008, 750, 9538], 10284 - 746),
+        (32, 8, [6080, 2000, 906, 22758], 23920 - 1162),
+        (64, 8, [10112, 2064, 1226, 50086], 49784),
+        (128, 8, [16384, 2064, 1888, 106640], 106012),
     ] {
         let sizes = sizes(free(installed), cores, cores).unwrap();
         let split = [sizes.heap, sizes.code.bytes, sizes.pool, sizes.guest].map(|b| b / MIB);
@@ -223,13 +298,14 @@ fn host_sizes_split_as_expected() {
 
 /// The 16 GiB PC that ran on the floor (`HOST MEMORY free=13590M heap=3072M
 /// code=784M pool=744M guest=8990M`) and failed allocations with the heap
-/// 2.6 GiB live gets the target, more than a GiB above the 2924 and 3168
-/// MiB the 16 and 32 GiB PCs carved at most, and the guest keeps its room.
+/// 2.6 GiB live gets the target at its share's window, more than a GiB
+/// above the 2924 and 3168 MiB the 16 and 32 GiB PCs carved at most, and
+/// the guest keeps its room.
 #[test]
 fn a_16_gib_pc_takes_the_heap_target_from_its_guest() {
     let sizes = sizes(13590 * MIB, 8, 8).unwrap();
-    assert_eq!(sizes.code.window, 768 * MIB);
-    assert_eq!(sizes.heap, HEAP_TARGET + 256 * MIB);
+    assert_eq!(sizes.code.window, 848 * MIB);
+    assert_eq!(sizes.heap, HEAP_TARGET + 336 * MIB);
     assert!(sizes.heap >= 3168 * MIB + GIB);
     assert!(sizes.guest >= GUEST_ROOM, "{sizes:?}");
 }
@@ -275,9 +351,14 @@ fn hosts_past_the_guests_room_hold_a_long_sessions_heap_peak() {
             }
         }
     }
-    // The 16 GiB host on 8 PEs is on the target, at the session's window.
+    // The 16 GiB host on 8 PEs is on the target, moved from the session's
+    // window to its share's.
     let sizes = sizes(free(16), 8, 8).unwrap();
-    assert_eq!(sizes.heap - (LONG_SESSION_PEAK + LARGEST_ASKED), 34 * MIB);
+    let moved = HEAP_PER_WINDOW * (sizes.code.window - PEAK_WINDOW);
+    assert_eq!(
+        sizes.heap - (LONG_SESSION_PEAK + LARGEST_ASKED + moved),
+        34 * MIB
+    );
 }
 
 /// The target only takes from a guest above its room, never below it, and
@@ -320,9 +401,9 @@ fn an_8_gib_host_keeps_its_heap_floor() {
 fn a_2_tib_host_caps_every_part() {
     let sizes = sizes(free(2048), 8, 8).unwrap();
     assert_eq!(sizes.heap, HEAP_CEILING);
-    assert_eq!(sizes.code.bytes, 784 * MIB);
+    assert_eq!(sizes.code.bytes, 2064 * MIB);
     assert_eq!(sizes.pool, 8 * POOL_PER_RUNNER);
-    assert_eq!(sizes.guest, free(2048) - 24 * GIB - 784 * MIB);
+    assert_eq!(sizes.guest, free(2048) - 24 * GIB - 2064 * MIB);
 }
 
 #[test]

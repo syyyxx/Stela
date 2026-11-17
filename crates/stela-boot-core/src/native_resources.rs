@@ -136,12 +136,19 @@ const PARKED_POOL: u64 = 4 * 1024 * 1024;
 pub const PRIVATE_CODE: u64 = 2 * MIB;
 pub const PRIVATE_PARTS: u32 = 4;
 /// The board's code window holds the guest's working set of code once for
-/// every PE: free RAM / 16, at most [`WINDOW_PER_RUNNER`] per runner, 64 MiB
-/// to 2 GiB, in 16 MiB steps. The block table grows with it (one entry per
-/// 256 bytes, 128 MiB at 1 GiB and above), and each PE's ITLB to 16,384
-/// entries from 64 MiB.
+/// every PE: free RAM / 16, 64 MiB to 2 GiB, in 16 MiB steps. The block
+/// table grows with it (one entry per 256 bytes, 128 MiB at 1 GiB and
+/// above), and each PE's ITLB to 16,384 entries from 64 MiB.
+///
+/// The set does not shrink with the PEs: fewer PEs run the same macOS. A
+/// 16 GiB PC's desktop session on 8 PEs filled a 768 MiB window (1.6 million
+/// blocks) 14 times in 10 minutes: its ring took 6 to 10 of 32 parts every
+/// 10 s, and half of its installs were of blocks it had held before, 86% of
+/// them back within one turn of the ring. A window twice the size keeps a
+/// block for two of those turns, so most of them never leave.
 const WINDOW_SHARE: u64 = 16;
-/// The window per runner where the host's memory allows it. A sign-in on 8
+/// The window per runner where the guest would not keep its room beside the
+/// host's whole share ([`crate::host_memory::sizes`]). A sign-in on 8
 /// PEs with 512 MiB (64 MiB per runner) compiled 45% of its installs again
 /// within one turn of the ring, the code lock waited 3.5 s per 10 s, and
 /// each part the ring took cost about 0.75 s of PE time. With 704 MiB (88
@@ -156,7 +163,7 @@ pub const WINDOW_PER_RUNNER: u64 = 96 * MIB;
 pub const SMALL_WINDOW_PER_RUNNER: u64 = 64 * MIB;
 const MIN_WINDOW: u64 = 64 * MIB;
 const MAX_WINDOW: u64 = 2048 * MIB;
-const CODE_ALIGNMENT: u64 = 16 * MIB;
+pub const CODE_ALIGNMENT: u64 = 16 * MIB;
 pub const MAX_CODE_PARTS: u32 = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -198,24 +205,32 @@ pub const fn parked_reserve(cores: usize, runners: usize) -> (u64, u64) {
 
 /// The firmware code allocation: each of `cores` executors' private part
 /// and the board's window, sized from `free` host bytes and the `runners`
-/// that run PEs, checked before any firmware pages are reserved.
+/// that run PEs at [`WINDOW_PER_RUNNER`] each, checked before any firmware
+/// pages are reserved: what a host whose guest lacks its room for the
+/// host's whole share gets ([`crate::host_memory::sizes`]).
 pub fn code_reservation(free: u64, cores: usize, runners: usize) -> Result<CodeReservation> {
-    code_reservation_per_runner(free, cores, runners, WINDOW_PER_RUNNER)
+    code_reservation_within(free, cores, runners, runners as u64 * WINDOW_PER_RUNNER)
 }
 
-/// [`code_reservation`] with at most `per_runner` bytes of window for each
-/// runner.
-pub fn code_reservation_per_runner(
+/// The window the host's share of `free` bytes gives, whatever its runners:
+/// the most [`code_reservation_within`] gives.
+pub fn window_share(free: u64) -> u64 {
+    (free / WINDOW_SHARE).clamp(MIN_WINDOW, MAX_WINDOW) / CODE_ALIGNMENT * CODE_ALIGNMENT
+}
+
+/// [`code_reservation`] with a window of the host's share of `free` bytes
+/// and at most `most` bytes, within the window's bounds.
+pub fn code_reservation_within(
     free: u64,
     cores: usize,
     runners: usize,
-    per_runner: u64,
+    most: u64,
 ) -> Result<CodeReservation> {
     if cores == 0 || cores > MAX_CORES || runners == 0 || runners > cores {
         return Err(refuse!("invalid native executor count"));
     }
     let window = (free / WINDOW_SHARE)
-        .min(runners as u64 * per_runner)
+        .min(most)
         .clamp(MIN_WINDOW, MAX_WINDOW)
         / CODE_ALIGNMENT
         * CODE_ALIGNMENT;
@@ -300,6 +315,41 @@ mod tests {
         for (cores, runners) in [(0, 0), (1, 0), (2, 3), (MAX_CORES + 1, 1)] {
             assert!(code_reservation(0, cores, runners).is_err());
         }
+    }
+
+    #[test]
+    fn the_hosts_share_of_window_does_not_depend_on_its_runners() {
+        for (free, window) in [
+            (0, 64),
+            (6 * 1024, 384),
+            (7936, 496),
+            (16 * 1024, 1024),
+            (32 * 1024, 2048),
+            (128 * 1024, 2048),
+        ] {
+            assert_eq!(window_share(free * MIB), window * MIB, "{free}");
+            for (cores, runners) in [(1, 1), (2, 2), (8, 8), (64, 8)] {
+                let code = code_reservation_within(free * MIB, cores, runners, u64::MAX).unwrap();
+                assert_eq!(
+                    code,
+                    CodeReservation {
+                        bytes: cores as u64 * PRIVATE_CODE + window * MIB,
+                        parts: PRIVATE_PARTS,
+                        window: window * MIB,
+                    },
+                    "{free} {cores} {runners}"
+                );
+            }
+        }
+        // A bound under the share holds, within the window's own bounds.
+        let within = |most: u64| {
+            code_reservation_within(32 * 1024 * MIB, 8, 8, most)
+                .unwrap()
+                .window
+        };
+        assert_eq!(within(800 * MIB), 800 * MIB);
+        assert_eq!(within(0), MIN_WINDOW);
+        assert!(code_reservation_within(0, 2, 3, u64::MAX).is_err());
     }
 
     #[test]

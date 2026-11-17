@@ -3,8 +3,8 @@
 //! left for the guest, and what is left of it for the translation pack.
 use crate::Result;
 use crate::native_resources::{
-    CodeReservation, SMALL_WINDOW_PER_RUNNER, WINDOW_PER_RUNNER, code_reservation_per_runner,
-    parked_reserve,
+    CODE_ALIGNMENT, CodeReservation, SMALL_WINDOW_PER_RUNNER, WINDOW_PER_RUNNER,
+    code_reservation_within, parked_reserve, window_share,
 };
 use stela_contracts::refuse;
 
@@ -191,9 +191,11 @@ impl Shortfall {
 ///   [`HEAP_FLOOR`]..=[`HEAP_CEILING`], the floor moved by the window's
 ///   difference from [`FLOOR_WINDOW`]; below [`HEAP_TARGET`] (moved the
 ///   same way), as much more as leaves the guest [`GUEST_ROOM`];
-/// - the code arena what `code_reservation` gives: [`WINDOW_PER_RUNNER`]
-///   per runner within free RAM / 16, or [`SMALL_WINDOW_PER_RUNNER`] where
-///   the larger window would leave the guest under its floor;
+/// - the code arena each executor's own part and the board's window: free
+///   RAM / 16 where the guest keeps [`GUEST_ROOM`] beside it and the heap's
+///   target, as much of it as does on hosts between, and no less than
+///   [`WINDOW_PER_RUNNER`] per runner, or [`SMALL_WINDOW_PER_RUNNER`] where
+///   that would leave the guest under its floor;
 /// - the pool, for each of up to [`POOL_SHARERS`] runners, 1/[`POOL_SHARE`]
 ///   of the guest's DRAM, which is what the other parts leave, or its halves'
 ///   sizes ([`pool_halves`]) if that is less: `pool = sharers * (free - heap -
@@ -236,21 +238,55 @@ fn estimate_guest(free: u64, cores: usize, runners: usize) -> Result<u64> {
     estimate(free, cores, runners).map(|sizes| sizes.guest)
 }
 
-/// The sizes with the larger code window per runner, or with the smaller
-/// one where the larger would leave the guest under its floor.
+/// The sizes with the code window the host's memory allows: the host's
+/// share where the guest keeps its room beside it and the heap's target,
+/// else the larger window per runner, or the smaller one where the larger
+/// would leave the guest under its floor.
 fn estimate(free: u64, cores: usize, runners: usize) -> Result<Sizes> {
-    let large = estimate_with(free, cores, runners, WINDOW_PER_RUNNER)?;
-    if large.guest >= GUEST_FLOOR {
+    let per_runner = |each: u64| estimate_within(free, cores, runners, runners as u64 * each);
+    let large = per_runner(WINDOW_PER_RUNNER)?;
+    if large.guest < GUEST_FLOOR {
+        return per_runner(SMALL_WINDOW_PER_RUNNER);
+    }
+    // The guest shrinks as the window grows, by the window and its block
+    // records: the largest window up to the host's share that leaves the
+    // guest its room with the heap on its target, in whole steps.
+    let roomy = |window: u64| -> Result<bool> {
+        let code = code_reservation_within(free, cores, runners, window)?;
+        let shared = shared_heap(free, runners, code.window);
+        let heap = shared.max(heap_target(shared, code.window));
+        Ok(split(free, heap, code, cores, runners).guest >= GUEST_ROOM)
+    };
+    let (mut low, mut high) = (
+        large.code.window / CODE_ALIGNMENT,
+        window_share(free) / CODE_ALIGNMENT,
+    );
+    if low >= high || !roomy((low + 1) * CODE_ALIGNMENT)? {
         return Ok(large);
     }
-    estimate_with(free, cores, runners, SMALL_WINDOW_PER_RUNNER)
+    while low < high {
+        let middle = (low + high).div_ceil(2);
+        if roomy(middle * CODE_ALIGNMENT)? {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    estimate_within(free, cores, runners, low * CODE_ALIGNMENT)
 }
 
-fn estimate_with(free: u64, cores: usize, runners: usize, per_runner: u64) -> Result<Sizes> {
-    let code = code_reservation_per_runner(free, cores, runners, per_runner)?;
+/// The heap's target for a `window`, on a host whose share of heap is
+/// `shared`: [`HEAP_TARGET`] moved by the window, within the ceiling.
+fn heap_target(shared: u64, window: u64) -> u64 {
+    at_window(HEAP_TARGET, window).min(HEAP_CEILING.max(shared))
+}
+
+/// The sizes with a code window of at most `most` bytes.
+fn estimate_within(free: u64, cores: usize, runners: usize, most: u64) -> Result<Sizes> {
+    let code = code_reservation_within(free, cores, runners, most)?;
     let shared = shared_heap(free, runners, code.window);
     let base = split(free, shared, code, cores, runners);
-    let target = at_window(HEAP_TARGET, code.window).min(HEAP_CEILING.max(shared));
+    let target = heap_target(shared, code.window);
     if target <= shared || base.guest <= GUEST_ROOM {
         return Ok(base);
     }
