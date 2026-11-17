@@ -136,12 +136,22 @@ pub enum PlacementError {
 /// Homogeneous host classes keep the original BSP-first assignment. When the
 /// guest has fewer slots, choose from the complete host roster; a
 /// matching class beyond the first guest-count workers remains eligible.
+///
+/// `cores` names each host worker's physical core: workers with one name
+/// are SMT threads of one core, and two busy threads of a core each run at
+/// little more than half its speed. A guest keeps background work on its
+/// efficiency PEs so that it does not slow its performance PEs, which holds
+/// only when they share no core. So where assigned workers of one host class
+/// share cores, their guest slots are dealt again ([`pair_siblings`]):
+/// efficiency slots share cores with each other and performance slots take
+/// the cores that carry one worker first.
 pub fn placement(
     guest: &[CoreClass],
     host: &[CoreClass],
+    cores: &[u32],
     boot: usize,
 ) -> Result<Vec<usize>, PlacementError> {
-    if guest.is_empty() || guest.len() > host.len() {
+    if guest.is_empty() || guest.len() > host.len() || cores.len() != host.len() {
         return Err(PlacementError::Cardinality);
     }
     if host.len() > MAX_CORES {
@@ -162,7 +172,9 @@ pub fn placement(
         })
         .collect();
     if host.windows(2).all(|pair| pair[0] == pair[1]) {
-        return Ok(original);
+        let mut assigned = original;
+        pair_siblings(guest, host, cores, boot, &mut assigned);
+        return Ok(assigned);
     }
     let mut assigned = alloc::vec![usize::MAX; guest.len()];
     let mut used = alloc::vec![false; host.len()];
@@ -212,7 +224,124 @@ pub fn placement(
             }
         }
     }
+    pair_siblings(guest, host, cores, boot, &mut assigned);
     Ok(assigned)
+}
+
+/// Whether a guest slot of `class` runs the work its kernel keeps away from
+/// its performance PEs.
+fn efficient(class: CoreClass) -> bool {
+    matches!(class, CoreClass::Efficiency | CoreClass::LowPower)
+}
+
+/// Deal the guest slots of each host class's assigned workers again where
+/// those workers share physical cores, leaving every slot on a worker of
+/// the host class it had and the boot slot on worker zero. Efficiency slots
+/// take the workers that share the boot slot's core when it is one of
+/// them, then the other shared cores thread by thread, then the cores with
+/// one worker; a performance boot slot's own core comes last for them. The
+/// other slots take what is left: cores with one worker first, then shared
+/// cores. A class whose assigned workers share no core, or whose slots are
+/// all of one kind, keeps its assignment.
+fn pair_siblings(
+    guest: &[CoreClass],
+    host: &[CoreClass],
+    cores: &[u32],
+    boot: usize,
+    assigned: &mut [usize],
+) {
+    let mut carried = alloc::vec![0u32; host.len()];
+    for &worker in assigned.iter() {
+        carried[worker] += 1;
+    }
+    // Workers of the core `worker` is on that carry a slot, itself included.
+    let on_core = |worker: usize| {
+        (0..host.len())
+            .filter(|&other| {
+                carried[other] != 0 && host[other] == host[worker] && cores[other] == cores[worker]
+            })
+            .count()
+    };
+    let mut classes: Vec<CoreClass> = Vec::new();
+    for &worker in assigned.iter() {
+        if !classes.contains(&host[worker]) {
+            classes.push(host[worker]);
+        }
+    }
+    for class in classes {
+        // This class's assigned workers but the boot worker, in host order,
+        // and their slots but the boot slot, in guest order.
+        let mut workers: Vec<usize> = assigned
+            .iter()
+            .copied()
+            .filter(|&worker| host[worker] == class && worker != assigned[boot])
+            .collect();
+        workers.sort_unstable();
+        if workers.iter().all(|&worker| on_core(worker) == 1)
+            && (host[assigned[boot]] != class || on_core(assigned[boot]) == 1)
+        {
+            continue;
+        }
+        let slots: Vec<usize> = (0..guest.len())
+            .filter(|&slot| slot != boot && host[assigned[slot]] == class)
+            .collect();
+        // Slots of one kind have nothing to keep apart.
+        let mut kinds = slots
+            .iter()
+            .map(|&slot| efficient(guest[slot]))
+            .chain((host[assigned[boot]] == class).then_some(efficient(guest[boot])));
+        let first = kinds.next();
+        if kinds.all(|kind| Some(kind) == first) {
+            continue;
+        }
+        let beside_boot =
+            |worker: usize| host[assigned[boot]] == class && cores[worker] == cores[assigned[boot]];
+        // Shared cores in the order of their first worker, thread by thread.
+        let first_on_core = |worker: usize| {
+            workers
+                .iter()
+                .copied()
+                .find(|&other| cores[other] == cores[worker])
+                .unwrap_or(worker)
+        };
+        let boot_efficient = efficient(guest[boot]);
+        let mut preferred = workers.clone();
+        preferred.sort_by_key(|&worker| {
+            let rank = if beside_boot(worker) {
+                if boot_efficient { 0 } else { 3 }
+            } else if on_core(worker) > 1 {
+                1
+            } else {
+                2
+            };
+            (rank, first_on_core(worker), worker)
+        });
+        let efficiency = slots.iter().filter(|&&slot| efficient(guest[slot])).count();
+        let (shared, alone) = preferred.split_at(efficiency);
+        // What the efficiency slots left: cores with one worker, then the
+        // shared ones, a core's first threads before its second ones, and
+        // the boot slot's core last when its sibling would not match.
+        let mut alone = alone.to_vec();
+        alone.sort_by_key(|&worker| {
+            let rank = if beside_boot(worker) {
+                if boot_efficient { 2 } else { 1 }
+            } else if on_core(worker) > 1 {
+                1
+            } else {
+                0
+            };
+            (rank, worker)
+        });
+        let (mut shared, mut alone) = (shared.iter(), alone.iter());
+        for slot in slots {
+            let next = if efficient(guest[slot]) {
+                shared.next()
+            } else {
+                alone.next()
+            };
+            assigned[slot] = *next.expect("as many workers as slots in a host class");
+        }
+    }
 }
 
 #[repr(C)]

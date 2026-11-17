@@ -15,6 +15,23 @@ fn processor(number: u32, package: u32, core: u32, thread: u32) -> Processor {
     }
 }
 
+/// [`super::placement`] on a host whose workers each have a core of their
+/// own.
+fn placement(
+    guest: &[CoreClass],
+    host: &[CoreClass],
+    boot: usize,
+) -> Result<Vec<usize>, PlacementError> {
+    let cores: Vec<u32> = (0..host.len() as u32).collect();
+    super::placement(guest, host, &cores, boot)
+}
+
+/// The cores of `workers` threads on `cores` physical cores in [`select`]'s
+/// order: every core's first thread, then the second threads.
+fn threads(workers: usize, cores: usize) -> Vec<u32> {
+    (0..workers).map(|worker| (worker % cores) as u32).collect()
+}
+
 fn classified_snapshot(vendor: [u32; 3], maximum: u32, class: Cpuid) -> Snapshot {
     let mut snapshot = Snapshot::default();
     snapshot.records[0] = Cpuid {
@@ -223,6 +240,119 @@ fn placement_searches_all_kept_workers_when_guest_has_fewer_slots() {
 }
 
 #[test]
+fn efficiency_slots_share_cores_and_performance_slots_keep_their_own() {
+    use CoreClass::{Efficiency as E, Performance as P, Unknown as U};
+    let guest = [E, E, E, E, P, P, P, P];
+    // Six cores of two threads run eight PEs: two cores carry two PEs each.
+    // Those four are the efficiency PEs; no performance PE shares a core.
+    assert_eq!(
+        super::placement(&guest, &[U; 8], &threads(8, 6), 0),
+        Ok(vec![0, 6, 1, 7, 2, 3, 4, 5])
+    );
+    // Four cores of two threads: two cores for each kind, and the first
+    // two performance PEs on cores of their own.
+    assert_eq!(
+        super::placement(&guest, &[U; 8], &threads(8, 4), 0),
+        Ok(vec![0, 4, 1, 5, 2, 3, 6, 7])
+    );
+    // A performance boot PE keeps its core's second thread for its kind.
+    assert_eq!(
+        super::placement(&[P, P, E, E], &[U; 4], &threads(4, 2), 0),
+        Ok(vec![0, 2, 1, 3])
+    );
+    // Enough cores, or PEs of one kind: the order the host gave.
+    for cores in [threads(8, 8), threads(16, 8)[..8].to_vec()] {
+        assert_eq!(
+            super::placement(&guest, &[U; 8], &cores, 0),
+            Ok((0..8).collect())
+        );
+    }
+    for kind in [E, P, U] {
+        assert_eq!(
+            super::placement(&[kind; 8], &[U; 8], &threads(8, 4), 0),
+            Ok((0..8).collect())
+        );
+    }
+    // Hybrid hosts keep each PE on a worker of the class it matched.
+    let host = [P, P, E, E, E, E, P, P];
+    let cores = [0, 1, 2, 3, 4, 5, 0, 1];
+    let apart = placement(&guest, &host, 0).unwrap();
+    let paired = super::placement(&guest, &host, &cores, 0).unwrap();
+    for slot in 0..guest.len() {
+        assert_eq!(host[paired[slot]], host[apart[slot]]);
+    }
+}
+
+#[test]
+fn shared_cores_mix_kinds_on_one_core_at_most() {
+    use CoreClass::{Efficiency as E, Performance as P, Unknown as U};
+    for workers in 2..=8usize {
+        for physical in workers.div_ceil(2)..=workers {
+            let cores = threads(workers, physical);
+            let alone = 2 * physical - workers;
+            for bits in 0..1usize << workers {
+                let guest: Vec<_> = (0..workers)
+                    .map(|slot| if bits >> slot & 1 == 0 { E } else { P })
+                    .collect();
+                for boot in 0..workers {
+                    let host = alloc::vec![U; workers];
+                    let assigned = super::placement(&guest, &host, &cores, boot).unwrap();
+                    assert_eq!(assigned[boot], 0);
+                    let mut sorted = assigned.clone();
+                    sorted.sort_unstable();
+                    assert_eq!(sorted, (0..workers).collect::<Vec<_>>());
+                    // The kinds on each core.
+                    let on = |core: u32, kind: CoreClass| {
+                        (0..workers)
+                            .filter(|&slot| cores[assigned[slot]] == core && guest[slot] == kind)
+                            .count()
+                    };
+                    let mixed = (0..physical as u32)
+                        .filter(|&core| on(core, E) != 0 && on(core, P) != 0)
+                        .count();
+                    assert!(
+                        mixed <= 1,
+                        "{guest:?} boot {boot} on {cores:?}: {assigned:?}"
+                    );
+                    // Performance PEs share a core only when the cores
+                    // with one thread are used up, the boot PE's aside. A
+                    // performance boot PE on a shared core keeps efficiency
+                    // PEs off it while another worker is left for them,
+                    // which may be a core with one thread.
+                    let shares = |slot: usize| {
+                        cores
+                            .iter()
+                            .filter(|&&core| core == cores[assigned[slot]])
+                            .count()
+                            > 1
+                    };
+                    let sharing = (0..workers)
+                        .filter(|&slot| guest[slot] == P && shares(slot))
+                        .count();
+                    let boot_shares = shares(boot);
+                    let free = (0..workers)
+                        .filter(|&slot| slot != boot && guest[slot] == P)
+                        .count();
+                    let room = alone - usize::from(!boot_shares);
+                    let least = if guest[boot] == P && boot_shares {
+                        let efficiency = workers - 1 - free;
+                        let elsewhere = workers - alone - 2;
+                        let taken = efficiency.saturating_sub(elsewhere).min(alone);
+                        1 + free.saturating_sub(alone - taken)
+                    } else {
+                        free.saturating_sub(room)
+                    };
+                    assert_eq!(
+                        sharing, least,
+                        "{guest:?} boot {boot} on {cores:?}: {assigned:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn placement_rejects_invalid_rosters() {
     use CoreClass::Unknown as U;
     assert_eq!(placement(&[], &[], 0), Err(PlacementError::Cardinality));
@@ -231,6 +361,10 @@ fn placement_rejects_invalid_rosters() {
         Err(PlacementError::Cardinality)
     );
     assert_eq!(placement(&[U], &[U], 1), Err(PlacementError::Bootstrap));
+    assert_eq!(
+        super::placement(&[U, U], &[U, U], &[0], 0),
+        Err(PlacementError::Cardinality)
+    );
     assert_eq!(
         placement(&[U; MAX_CORES + 1], &[U; MAX_CORES + 1], 0),
         Err(PlacementError::Capacity)

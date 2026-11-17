@@ -359,10 +359,12 @@ impl<'a> Source<'a> {
         roster: &'s dyn RetainedRoster,
         profile: CpuProfile,
     ) -> Result<Prepared<'s>> {
+        let workers = roster.cores().len();
         self.prepare_with_classes(
             roster,
             profile,
-            &alloc::vec![native::CoreClass::Unknown; roster.cores().len()],
+            &alloc::vec![native::CoreClass::Unknown; workers],
+            &(0..workers as u32).collect::<Vec<_>>(),
         )
     }
 
@@ -373,7 +375,35 @@ impl<'a> Source<'a> {
         capture: &Capture,
     ) -> Result<Prepared<'s>> {
         let classes = Self::host_classes(roster, capture)?;
-        self.prepare_with_classes(roster, profile, &classes)
+        let cores = Self::host_cores(roster, capture)?;
+        self.prepare_with_classes(roster, profile, &classes, &cores)
+    }
+
+    /// Each assigned worker's physical core, named by the first worker on
+    /// it: SMT threads of one core have one firmware location.
+    fn host_cores(roster: &dyn RetainedRoster, capture: &Capture) -> Result<Vec<u32>> {
+        let locations = roster
+            .cores()
+            .iter()
+            .map(|core| {
+                capture
+                    .selected
+                    .get(core.worker)
+                    .filter(|_| core.worker < capture.core_count as usize)
+                    .and_then(|&index| capture.processors.get(index as usize))
+                    .map(|processor| processor.location)
+                    .ok_or(refuse!("assigned worker has no captured location"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(locations
+            .iter()
+            .map(|location| {
+                locations
+                    .iter()
+                    .position(|other| other == location)
+                    .unwrap_or_default() as u32
+            })
+            .collect())
     }
 
     fn host_classes(
@@ -431,6 +461,7 @@ impl<'a> Source<'a> {
         roster: &'s dyn RetainedRoster,
         profile: CpuProfile,
         host: &[native::CoreClass],
+        cores: &[u32],
     ) -> Result<Prepared<'s>> {
         use stela_crypto::Sha256;
         use stela_crypto::digest::Digest;
@@ -448,7 +479,7 @@ impl<'a> Source<'a> {
             .position(|slot| slot.reg == self.boot_reg)
             .ok_or(refuse!("assigned source omits the original boot PE"))?;
         let guest = self.guest_classes()?;
-        let placement = native::placement(&guest, host, boot)
+        let placement = native::placement(&guest, host, cores, boot)
             .map_err(|error| refuse!("assigned host core placement: {error}", ?error))?;
         for (ordinal, slot) in resources.slots.iter().enumerate() {
             // Source PE order keeps PMGR's cluster ordinal coupling; only
