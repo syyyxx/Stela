@@ -1316,6 +1316,73 @@ pub const AMDGPU: &[Recipe] = &[
         114164,
         "286458c7911172734dd514631dcfba9690c2242f24f9be72afd6b56c0341974a",
     ),
+    // Navi 23 (Dimgrey Cavefish): amdgpu names these files after the chip,
+    // as Navi 21's (`amdgpu_ucode.c`: graphics core 10.3.4, security
+    // processor 11.0.12, DMA engine 5.2.4, power management 11.0.12, video
+    // 3.0.16). MEC2 is byte for byte MEC.
+    amdgpu(
+        "amdgpu/dimgrey_cavefish_ce.bin",
+        263296,
+        "5ca83eb729c449d14a474c1bd5d29cdd3ba331f678a2013c4abf3b56a7b2bccb",
+    ),
+    amdgpu(
+        "amdgpu/dimgrey_cavefish_me.bin",
+        263424,
+        "2a7987abc4e5b358588e3db667096fd8021a0b6e75d79a4b953695561e6361b3",
+    ),
+    amdgpu(
+        "amdgpu/dimgrey_cavefish_mec.bin",
+        268160,
+        "68bda4aa94d7408943080952c881560f853bdb13192857d7363e2d85d135e84c",
+    ),
+    // The same bytes as `mec`, under the second name the driver asks for.
+    amdgpu(
+        "amdgpu/dimgrey_cavefish_mec2.bin",
+        268160,
+        "68bda4aa94d7408943080952c881560f853bdb13192857d7363e2d85d135e84c",
+    ),
+    amdgpu(
+        "amdgpu/dimgrey_cavefish_pfp.bin",
+        263424,
+        "94a9a434c100209aa0b9d4ff5b023e91943d14a3d73e652b7ae0309d8a6ea8b9",
+    ),
+    amdgpu(
+        "amdgpu/dimgrey_cavefish_rlc.bin",
+        137232,
+        "4ad937c4c2e165acf9ab47dec33a801bc75901b85615921eb23835594ba4eeca",
+    ),
+    amdgpu(
+        "amdgpu/dimgrey_cavefish_sdma.bin",
+        34048,
+        "7f645b4aaed29dab5db54f5dd6ced67e16bffa0e877769f88b4040a8dbe93f9c",
+    ),
+    amdgpu(
+        "amdgpu/dimgrey_cavefish_smc.bin",
+        244902,
+        "cc822ff5d95b8f8fbc0856138c08e462027dcd90c0ac6cf33d5ce34888731d00",
+    ),
+    amdgpu(
+        "amdgpu/dimgrey_cavefish_sos.bin",
+        210416,
+        "ec4ac3c065b814ad164eb6d19f2009c225baed0eb52a7bcbaae324c4b0be11b2",
+    ),
+    amdgpu(
+        "amdgpu/dimgrey_cavefish_ta.bin",
+        259328,
+        "744d1a60888e23af672ce13923dadfe21d35c122e64d4a0629f9bfc26eae832b",
+    ),
+    amdgpu(
+        "amdgpu/dimgrey_cavefish_vcn.bin",
+        582800,
+        "2f3cbd54cc9fad35665c06079f61e175dae3dca34d971bfeb73e4ab3efd7bf65",
+    ),
+    // The display core's DMCUB, which `amdgpu_dm.c` names for the chip
+    // (`FIRMWARE_DIMGREY_CAVEFISH_DMUB`): the same bytes as Navi 21's.
+    amdgpu(
+        "amdgpu/dimgrey_cavefish_dmcub.bin",
+        114164,
+        "286458c7911172734dd514631dcfba9690c2242f24f9be72afd6b56c0341974a",
+    ),
 ];
 
 /// A GPU family's name, PCI device IDs and files.
@@ -1387,6 +1454,29 @@ const AMDGPU_FAMILIES: &[AmdgpuFamily] = &[
             "amdgpu/sienna_cichlid_ta.bin",
             "amdgpu/sienna_cichlid_vcn.bin",
             "amdgpu/sienna_cichlid_dmcub.bin",
+        ],
+    ),
+    (
+        "Radeon RX 6600, 6600 XT or 6650 XT (Navi 23)",
+        // amdgpu's ID table lists these under CHIP_DIMGREY_CAVEFISH; 1002:73ff
+        // is the RX 6600 XT.
+        &[
+            0x73e0, 0x73e1, 0x73e2, 0x73e3, 0x73e8, 0x73e9, 0x73ea, 0x73eb, 0x73ec, 0x73ed, 0x73ef,
+            0x73ff,
+        ],
+        &[
+            "amdgpu/dimgrey_cavefish_ce.bin",
+            "amdgpu/dimgrey_cavefish_me.bin",
+            "amdgpu/dimgrey_cavefish_mec.bin",
+            "amdgpu/dimgrey_cavefish_mec2.bin",
+            "amdgpu/dimgrey_cavefish_pfp.bin",
+            "amdgpu/dimgrey_cavefish_rlc.bin",
+            "amdgpu/dimgrey_cavefish_sdma.bin",
+            "amdgpu/dimgrey_cavefish_smc.bin",
+            "amdgpu/dimgrey_cavefish_sos.bin",
+            "amdgpu/dimgrey_cavefish_ta.bin",
+            "amdgpu/dimgrey_cavefish_vcn.bin",
+            "amdgpu/dimgrey_cavefish_dmcub.bin",
         ],
     ),
 ];

@@ -1,0 +1,179 @@
+# Build Stela with the AMD GPU port (amdgpu + RADV) and the Navi 23
+# (Radeon RX 6600 / 6600 XT / 6650 XT) firmware recipes, as a
+# Windows `stela.exe` archive.
+#
+# Chain: Stela.app (macOS) -> stela.efi (Linux, --radv) -> stela.exe
+# (Windows, --features amdgpu-port). Run it from the Actions tab.
+name: AMD build (amdgpu + RADV)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  APP: guest/stela-app
+  NOTES: .github/release-notes.txt
+
+jobs:
+  app:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build Stela.app
+        run: |
+          swift --version
+          # build.sh prints the bundle's path last.
+          app="$(bash "$APP/build.sh" | tee /dev/stderr | tail -1)"
+          [[ -f "$app/Contents/Info.plist" ]] || { echo "::error::$APP/build.sh named no app bundle: $app"; exit 1; }
+          tar -C "$(dirname "$app")" -cf Stela.app.tar Stela.app
+
+      - uses: actions/upload-artifact@v4
+        name: Upload Stela.app
+        with:
+          name: stela-app
+          path: Stela.app.tar
+          if-no-files-found: error
+          retention-days: 7
+
+  efi:
+    needs: app
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Clang 21 and the GPU host tools
+        run: |
+          # The kext needs upstream Clang 21 or newer for arm64e. The Intel
+          # and AMD Vulkan drivers' builds run glslangValidator 12.2 or newer
+          # and mesa_clc, which links LLVM 21 and libclang-cpp 21 (and the
+          # SPIR-V libraries spirv.sh builds below).
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            clang-21 lld-21 llvm-21 llvm-21-dev libclang-21-dev libclang-cpp21-dev \
+            glslang-tools ninja-build
+          echo /usr/lib/llvm-21/bin >> "$GITHUB_PATH"
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install
+          rustc --version
+          version="$(clang --version)"
+          echo "${version%%$'\n'*}"
+          [[ "$version" =~ version\ (2[1-9]|[3-9][0-9])\. ]] || { echo "::error::clang on PATH is older than 21"; exit 1; }
+
+      - name: SPIR-V libraries
+        run: |
+          bash .github/spirv.sh .tools/spirv
+          echo "PKG_CONFIG_PATH=$PWD/.tools/spirv/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@v4
+        name: Download Stela.app
+        with:
+          name: stela-app
+          path: app
+
+      - name: Unpack Stela.app
+        run: |
+          tar -C app -xf app/Stela.app.tar
+          echo "STELA_APP=$PWD/app/Stela.app" >> "$GITHUB_ENV"
+
+      - name: Fetch upstream sources
+        run: cargo xtask gpu fetch
+
+      - name: Build stela.efi with amdgpu and RADV
+        env:
+          STELA_RELEASE: "1"
+        run: |
+          cargo xtask boot build --release --radv
+          echo "Vulkan drivers: $(paste -sd, target/gpu/nvk/vulkan-drivers)" >> "$GITHUB_STEP_SUMMARY"
+          efi=target/boot/x86_64-unknown-uefi/release/stela-deploy.efi
+          [[ "$(head -c 2 "$efi")" == MZ ]] || { echo "::error::$efi is not a PE image"; exit 1; }
+          mkdir -p dist
+          cp "$efi" dist/stela.efi
+          ls -l dist/stela.efi
+          { echo "stela.efi: $(stat -c %s dist/stela.efi) bytes"; echo "sha256 $(sha256sum dist/stela.efi | cut -d ' ' -f1)"; } >> "$GITHUB_STEP_SUM"
+
+      - uses: actions/upload-artifact@v4
+        name: Upload stela.efi
+        with:
+          name: stela-efi
+          path: dist/stela.efi
+          if-no-files-found: error
+          retention-days: 7
+
+  cli:
+    needs: efi
+    runs-on: windows-2025
+    timeout-minutes: 90
+    env:
+      ARCHIVE: stela-amd-6600xt-windows-x86_64
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Put LLVM on PATH
+        run: echo 'C:\Program Files\LLVM\bin' >> "$GITHUB_PATH"
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install
+          rustup target add x86_64-pc-windows-msvc
+          rustc --version
+          # stela-tls compiles Mbed TLS with clang and archives it with llvm-lib.
+          for tool in clang llvm-lib; do
+            command -v "$tool" >/dev/null || { echo "::error::$tool is not on PATH"; exit 1; }
+          done
+          clang --version | head -1
+
+      - uses: actions/download-artifact@v4
+        name: Download stela.efi
+        with:
+          name: stela-efi
+          path: efi
+
+      - name: Build stela with the AMD firmware port
+        run: |
+          export STELA_EFI="$PWD/efi/stela.efi"
+          cargo build --release --locked -p stela-cli --features amdgpu-port --target x86_64-pc-windows-msvc
+          mkdir -p "$ARCHIVE"
+          cp target/x86_64-pc-windows-msvc/release/stela.exe "$ARCHIVE/"
+
+      - name: Check stela
+        run: |
+          version="$(awk '/^\[workspace.package\]/{s=1;next} s && /^\[/{exit} s && /^version = /{gsub(/"/,"",$3);print $3;exit}' Cargo.toml)"
+          binary="$ARCHIVE/stela.exe"
+          expected="stela $version"
+          actual="$("$binary" --version)"
+          [[ "$actual" == "$expected" ]] || { echo "::error::$binary --version printed '$actual', not '$expected'"; exit 1; }
+          python -c 'import sys; sys.exit(open(sys.argv[1], "rb").read() not in open(sys.argv[2], "rb").read())' efi/stela.efi "$binary" \
+            || { echo "::error::$binary does not hold the stela.efi the efi job built"; exit 1; }
+          "$binary" create --help >/dev/null
+          echo "$ARCHIVE: $(wc -c < "$binary") bytes" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Package
+        run: |
+          version="$(awk '/^\[workspace.package\]/{s=1;next} s && /^\[/{exit} s && /^version = /{gsub(/"/,"",$3);print $3;exit}' Cargo.toml)"
+          sed -e "s/@VERSION@/$version/g" -e '/^## Changes$/{N;d;}' "$NOTES" > "$ARCHIVE/INSTALL.txt"
+          cp -R LICENSE NOTICE LICENSES "$ARCHIVE/"
+          7z a -tzip -bso0 "$ARCHIVE.zip" "$ARCHIVE"
+          ls -l "$ARCHIVE.zip"
+
+      - uses: actions/upload-artifact@v4
+        name: Upload the Windows archive
+        with:
+          name: stela-amd-6600xt-windows-x86_64
+          path: stela-amd-6600xt-windows-x86_64.zip
+          if-no-files-found: error
+          retention-days: 14

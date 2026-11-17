@@ -20,12 +20,12 @@ fn the_complete_bundle_holds_every_recipe_once_by_content() {
     let (count, bytes) = size();
     assert_eq!(count, objects.len());
     // The RTL8168H and RTL8168M share a file, as the RTL9151A and RTL9151AS
-    // do, and, with the AMD port, amdgpu's `mec` and `mec2` of Raphael and
-    // of Navi 21.
+    // do, and, with the AMD port, amdgpu's `mec` and `mec2` of Raphael, of
+    // Navi 21 and of Navi 23, and the `dmcub` Navi 23 shares with Navi 21.
     if Ports::BUILT == Ports::ALL {
-        assert_eq!(count + 4, recipes().count());
-        // The recipes' recorded lengths: 121 files, 184.9 MiB.
-        assert_eq!((count, bytes), (121, 193_887_456), "{count} {bytes}");
+        assert_eq!(count + 6, recipes().count());
+        // The recipes' recorded lengths: 131 files, 187.3 MiB.
+        assert_eq!((count, bytes), (131, 196_414_486), "{count} {bytes}");
     }
     if Ports::BUILT == Ports::NONE {
         assert_eq!(count + 2, recipes().count());
