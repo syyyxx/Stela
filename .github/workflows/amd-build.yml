@@ -104,7 +104,7 @@ jobs:
           mkdir -p dist
           cp "$efi" dist/stela.efi
           ls -l dist/stela.efi
-          { echo "stela.efi: $(stat -c %s dist/stela.efi) bytes"; echo "sha256 $(sha256sum dist/stela.efi | cut -d ' ' -f1)"; } >> "$GITHUB_STEP_SUM"
+          { echo "stela.efi: $(stat -c %s dist/stela.efi) bytes"; echo "sha256 $(sha256sum dist/stela.efi | cut -d ' ' -f1)"; } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         name: Upload stela.efi
