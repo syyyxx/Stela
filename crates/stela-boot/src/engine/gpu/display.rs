@@ -29,6 +29,7 @@ use alloc::{boxed::Box, format, string::String, vec::Vec};
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::{cell::UnsafeCell, ffi::c_int, ffi::c_void, ptr::NonNull};
+use stela_boot_core::options::DisplaySize;
 use stela_contracts::refuse;
 use stela_drivers::gpu::metal::kms::{self, Display, Drm, Error as DisplayError, Watched};
 use stela_soc::machine::{MonitorId, Scanout, ScanoutFormat, ScanoutMode};
@@ -526,12 +527,19 @@ const RETURN_STEP_MILLIS: u64 = 100;
 pub(in crate::engine) fn take(
     wanted: (usize, usize),
     firmware: Shown<'_>,
-    size: Option<(u32, u32)>,
+    size: Option<DisplaySize>,
 ) {
     let Some(gpu) = super::installed() else {
         return;
     };
-    let wanted = (wanted.0 as u32, wanted.1 as u32);
+    let native = kms::Wanted::Native((wanted.0 as u32, wanted.1 as u32));
+    let wanted = match size {
+        Some(size) => match size.refresh_hz {
+            Some(hz) => kms::Wanted::SizeAtRefresh((size.width, size.height), hz),
+            None => kms::Wanted::Size((size.width, size.height)),
+        },
+        None => native,
+    };
     let bound = &gpu.start.bound;
     // SAFETY: the one boot CPU, before any reader.
     let (taken, waiting) = unsafe { &mut *TAKEN.0.get() };
@@ -552,14 +560,7 @@ pub(in crate::engine) fn take(
             false => 0,
         };
         let result = loop {
-            match Display::take_fitting(
-                Node(fd),
-                match size {
-                    Some(size) => kms::Wanted::Size(size),
-                    None => kms::Wanted::Native(wanted),
-                },
-                &stela_soc::dcp::modes::advertisable,
-            ) {
+            match Display::take_fitting(Node(fd), wanted, &stela_soc::dcp::modes::advertisable) {
                 Err(DisplayError::NoOutput) if host::rdtsc().wrapping_sub(began) < patience => {
                     let step = host::rdtsc();
                     while host::rdtsc().wrapping_sub(step) < gpu.tsc_hz / 1000 * RETURN_STEP_MILLIS
@@ -569,6 +570,21 @@ pub(in crate::engine) fn take(
                 }
                 result => break result,
             }
+        };
+        let (result, uses_native) = match (result, wanted) {
+            (
+                Err(DisplayError::ModeUnavailable),
+                kms::Wanted::SizeAtRefresh((width, height), hz),
+            ) => {
+                output::arguments(format_args!(
+                    "GPU {name}: no output lists {width}x{height} at {hz} Hz; using the normal display mode\n"
+                ));
+                (
+                    Display::take_fitting(Node(fd), native, &stela_soc::dcp::modes::advertisable),
+                    true,
+                )
+            }
+            (result, _) => (result, size.is_none()),
         };
         let waited_ms = host::rdtsc().wrapping_sub(began) / (gpu.tsc_hz / 1000).max(1);
         match result {
@@ -583,7 +599,7 @@ pub(in crate::engine) fn take(
                     "GPU {name}: display runs {width}x{height} at {} mHz\n",
                     display.refresh_millihertz()
                 ));
-                if size.is_none() && !display.preferred_listed() {
+                if uses_native && !display.preferred_listed() {
                     output::arguments(format_args!(
                         "GPU {name}: the output lists no preferred mode (its EDID marks none, or \
                          Linux left out the monitor's own mode as past the link's clock), so it \

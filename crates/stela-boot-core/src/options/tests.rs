@@ -74,6 +74,33 @@ fn round_trip(text: &str) -> System {
 }
 
 #[test]
+fn display_size_round_trips_an_optional_refresh() {
+    for (value, refresh_hz) in [("1920x1080", None), ("1920x1080@60", Some(60))] {
+        let options = round_trip(&format!("--system {DISPLAY_SIZE} {value}"));
+        assert_eq!(
+            options.display_size,
+            Some(DisplaySize {
+                width: 1920,
+                height: 1080,
+                refresh_hz,
+            })
+        );
+    }
+    for value in [
+        "1920x1080@",
+        "1920x1080@0",
+        "1920x1080@4294967295",
+        "0x1080@60",
+    ] {
+        assert_eq!(
+            System::parse(&format!("--system {DISPLAY_SIZE} {value}")).unwrap_err(),
+            Error::DisplaySize,
+            "{value}"
+        );
+    }
+}
+
+#[test]
 fn single_user_needs_a_preboot_selection() {
     let selected = round_trip(&format!("--system --preboot {DISK} {SINGLE_USER}"));
     assert!(selected.single_user);

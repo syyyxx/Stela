@@ -156,7 +156,9 @@ impl Error {
             }
             Self::DuplicateGuestPes => "--guest-pes must occur once",
             Self::GuestPeCount => "--guest-pes needs a processor count",
-            Self::DisplaySize => "--display-size needs WIDTHxHEIGHT, such as 1920x1080",
+            Self::DisplaySize => {
+                "--display-size needs WIDTHxHEIGHT or WIDTHxHEIGHT@HZ, such as 1920x1080@60"
+            }
             Self::MissingRestoreSource => "missing restore source partition",
             Self::DuplicateRestoreSource => "duplicate restore source",
             Self::MissingRestoreManifest => "missing restore manifest path",

@@ -34,9 +34,8 @@ pub const UPDATE_RESTORE: &str = mount_interface::UPDATE_RESTORE_OPTION;
 pub const EXTERNAL_DISKS: &str = "--external-disks";
 pub const NATIVE_CORES: &str = "--native-cores";
 pub const GUEST_PES: &str = "--guest-pes";
-/// The size a GPU's display is taken in (`--display-size WIDTHxHEIGHT`), in
-/// place of the monitor's preferred mode: for a capture device that cannot
-/// take the mode its EDID prefers.
+/// Overrides the preferred display size (`--display-size WIDTHxHEIGHT`).
+/// Add `@HZ` to select a listed refresh at that size.
 pub const DISPLAY_SIZE: &str = "--display-size";
 pub const MAINTENANCE_WRITE: &str = "--maintenance-write";
 /// Boots the installed system to its single-user shell.
@@ -56,6 +55,24 @@ pub const IPV4_GATEWAY: &str = "--ipv4-gateway";
 pub const DNS: &str = "--dns";
 /// The most `--dns` servers, as glibc's resolver keeps (`MAXNS`).
 pub const MAX_DNS_SERVERS: usize = 3;
+
+/// A display size override and its optional refresh in integer hertz.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct DisplaySize {
+    pub width: u32,
+    pub height: u32,
+    pub refresh_hz: Option<u32>,
+}
+
+impl fmt::Display for DisplaySize {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}x{}", self.width, self.height)?;
+        if let Some(refresh_hz) = self.refresh_hz {
+            write!(f, "@{refresh_hz}")?;
+        }
+        Ok(())
+    }
+}
 
 /// A `--audio-check` mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,8 +297,8 @@ pub struct System {
     /// The source PE count (`--guest-pes N`) recorded by setup for disk
     /// boots whose verified DeviceTree is loaded after firmware exit.
     pub guest_pes: Option<usize>,
-    /// The size a GPU's display is taken in ([`DISPLAY_SIZE`]).
-    pub display_size: Option<(u32, u32)>,
+    /// The size and optional refresh a GPU's display is taken in ([`DISPLAY_SIZE`]).
+    pub display_size: Option<DisplaySize>,
     /// Check owned AP startup/host resources, then stop before guest entry.
     pub native_bootstrap_check: bool,
     /// Bounded checked-memory kernel execution on the selected cores.
@@ -846,11 +863,7 @@ impl fmt::Display for System {
         line.flag("--sep-observe", self.sep_observe)?;
         line.value(NATIVE_CORES, self.native_cores)?;
         line.value(GUEST_PES, self.guest_pes)?;
-        line.value(
-            DISPLAY_SIZE,
-            self.display_size
-                .map(|(width, height)| alloc::format!("{width}x{height}")),
-        )?;
+        line.value(DISPLAY_SIZE, self.display_size)?;
         line.flag("--native-rounds", self.native_rounds)?;
         line.flag("--native-artifacts", self.native_artifacts)?;
         line.flag("--native-bootstrap-check", self.native_bootstrap_check)?;

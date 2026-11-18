@@ -1960,7 +1960,9 @@ pub(super) fn kexts() -> Vec<stela_loader::aux_kc::Kext<'static>> {
 pub(super) fn serve(
     #[cfg_attr(not(feature = "nvk"), allow(unused_variables))] screen: Option<(usize, usize)>,
     #[cfg_attr(not(feature = "nvk"), allow(unused_variables))] firmware: Option<&str>,
-    #[cfg_attr(not(feature = "nvk"), allow(unused_variables))] size: Option<(u32, u32)>,
+    #[cfg_attr(not(feature = "nvk"), allow(unused_variables))] size: Option<
+        stela_boot_core::options::DisplaySize,
+    >,
 ) {
     #[cfg(feature = "nvk")]
     {

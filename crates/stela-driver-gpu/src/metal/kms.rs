@@ -292,6 +292,8 @@ struct SetProperty {
 pub enum Error {
     /// No output is connected, or none has a mode or a controller to run it.
     NoOutput,
+    /// No connected output lists the requested size and refresh.
+    ModeUnavailable,
     /// A request failed, with its negative errno.
     Request(i64),
     /// A buffer could not be mapped.
@@ -427,6 +429,8 @@ pub struct Display<D> {
     /// of, fastest first, one a refresh: the rates [`Self::set_refresh`]
     /// switches between.
     rates: Vec<ModeInfo>,
+    /// The requested refresh for displays taken in an explicit timing.
+    requested_refresh: Option<u32>,
     /// The mode [`Self::set_refresh`] asked for, not yet set.
     retime: Option<ModeInfo>,
 }
@@ -786,6 +790,8 @@ pub enum Wanted {
     /// A mode of this size, else the preferred one: the guest's mode is
     /// set, and only that size is shown.
     Size((u32, u32)),
+    /// Only a listed, progressive mode of this size and nominal refresh in hertz.
+    SizeAtRefresh((u32, u32), u32),
 }
 
 fn size_of_mode(mode: &ModeInfo) -> (u32, u32) {
@@ -826,6 +832,22 @@ fn mode_of(modes: &[ModeInfo], size: (u32, u32), fits: Fits<'_>) -> Option<ModeI
     fitting.or_else(|| sized.next()).copied()
 }
 
+/// A listed timing at the requested nominal refresh (e.g. 59.94 Hz for
+/// 60 Hz). Prefer the closest timing and keep the first of equals.
+fn mode_at(modes: &[ModeInfo], size: (u32, u32), hertz: u32, fits: Fits<'_>) -> Option<ModeInfo> {
+    let millihertz = u64::from(hertz) * 1000;
+    modes
+        .iter()
+        .filter(|mode| size_of_mode(mode) == size && mode.flags & INTERLACED == 0)
+        .filter_map(|mode| {
+            let rate = refresh(mode);
+            let distance = u64::from(rate).abs_diff(millihertz);
+            (distance < 500 && fits(size.0, size.1, rate)).then_some((distance, *mode))
+        })
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, mode)| mode)
+}
+
 /// Whether sizes `a` and `b` have the same shape, within 1%: 1366x768 is
 /// 16:9.
 fn same_shape(a: (u32, u32), b: (u32, u32)) -> bool {
@@ -861,8 +883,15 @@ fn own_mode(modes: &[ModeInfo]) -> Option<&ModeInfo> {
 /// shows the picture where they share a size, as Linux's fbdev helper
 /// clones in a common mode. Earlier sizes win ties. The output that gives
 /// the mode is the first with a fitting mode of the size, else the first
-/// with one at all.
+/// with one at all. [`Wanted::SizeAtRefresh`] requires a listed, fitting timing on
+/// the first output that has one.
 fn plan(outputs: &[&[ModeInfo]], wanted: Wanted, fits: Fits<'_>) -> Option<((u32, u32), usize)> {
+    if let Wanted::SizeAtRefresh(size, hertz) = wanted {
+        let gives = outputs
+            .iter()
+            .position(|modes| mode_at(modes, size, hertz, fits).is_some())?;
+        return Some((size, gives));
+    }
     let preferred = outputs
         .iter()
         .filter_map(|modes| own_mode(modes).map(size_of_mode));
@@ -892,7 +921,7 @@ fn plan(outputs: &[&[ModeInfo]], wanted: Wanted, fits: Fits<'_>) -> Option<((u32
             .chain([firmware])
             .chain(listed)
             .collect(),
-        Wanted::Size(size) => [size]
+        Wanted::Size(size) | Wanted::SizeAtRefresh(size, _) => [size]
             .into_iter()
             .chain(preferred)
             .chain(shaped)
@@ -918,7 +947,7 @@ fn plan(outputs: &[&[ModeInfo]], wanted: Wanted, fits: Fits<'_>) -> Option<((u32
             let told = outputs.iter().any(|modes| fitting(modes, size));
             let rank = match wanted {
                 Wanted::Native(_) => (told, false, covered(size)),
-                Wanted::Size(only) => (told, size == only, 0),
+                Wanted::Size(only) | Wanted::SizeAtRefresh(only, _) => (told, size == only, 0),
             };
             (rank, core::cmp::Reverse(order))
         })?;
@@ -937,7 +966,10 @@ fn plan(outputs: &[&[ModeInfo]], wanted: Wanted, fits: Fits<'_>) -> Option<((u32
 #[cfg(test)]
 fn choose(modes: &[ModeInfo], wanted: Wanted, fits: Fits<'_>) -> Option<ModeInfo> {
     let (size, _) = plan(&[modes], wanted, fits)?;
-    mode_of(modes, size, fits)
+    match wanted {
+        Wanted::SizeAtRefresh(_, hertz) => mode_at(modes, size, hertz, fits),
+        _ => mode_of(modes, size, fits),
+    }
 }
 
 /// How an output after the first shows a picture of the display's size.
@@ -1136,7 +1168,14 @@ fn follow<D: Drm>(
     modes: &[ModeInfo],
     size: (u32, u32),
     timing: ModeInfo,
+    requested_refresh: Option<u32>,
 ) -> Result<Follow, Error> {
+    if let Some(hertz) = requested_refresh {
+        return Ok(match mode_at(modes, size, hertz, &|_, _, _| true) {
+            Some(mode) => Follow::Run(mode, None),
+            None => Follow::Dark { smaller: false },
+        });
+    }
     Ok(match fit(modes, size) {
         Fit::Mode(mode) => Follow::Run(mode, None),
         Fit::Scaled(native) => match scaler(drm, id)? {
@@ -1308,8 +1347,16 @@ impl<D: Drm> Display<D> {
         // What the firmware lit first, then DRM's order.
         usable.sort_by_key(|(_, found, _)| !found.lit);
         let modes: Vec<&[ModeInfo]> = usable.iter().map(|(_, found, _)| &*found.modes).collect();
+        let requested_refresh = match wanted {
+            Wanted::SizeAtRefresh(_, hertz) => Some(hertz),
+            _ => None,
+        };
         let Some((size, first)) = plan(&modes, wanted, fits) else {
-            return Err(Error::NoOutput);
+            return Err(if requested_refresh.is_some() && !modes.is_empty() {
+                Error::ModeUnavailable
+            } else {
+                Error::NoOutput
+            });
         };
         let first = usable.remove(first);
         let [width, height] = first.1.size_mm;
@@ -1318,7 +1365,12 @@ impl<D: Drm> Display<D> {
         let edid = edid(&mut drm, first.0).ok().flatten();
         let preferred = first.1.modes.iter().any(|mode| mode.kind & PREFERRED != 0);
         let mut heads: Vec<Head> = Vec::new();
-        let rates = rates_of(&first.1.modes, size, fits);
+        let rates = if requested_refresh.is_some() {
+            // Keep the guest on the selected timing.
+            Vec::new()
+        } else {
+            rates_of(&first.1.modes, size, fits)
+        };
         let (mut smaller, mut refused) = (0, None);
         for (id, found, reach) in core::iter::once(first).chain(usable) {
             let free = free_crtc(reach, &crtcs, &heads).zip(free_encoder(&found.encoders, &heads));
@@ -1327,8 +1379,19 @@ impl<D: Drm> Display<D> {
                 continue;
             };
             let run = match heads.first() {
-                None => mode_of(&found.modes, size, fits).map(|mode| (mode, None)),
-                Some(shown) => match follow(&mut drm, id, &found.modes, size, shown.mode) {
+                None => match requested_refresh {
+                    Some(hertz) => mode_at(&found.modes, size, hertz, fits),
+                    None => mode_of(&found.modes, size, fits),
+                }
+                .map(|mode| (mode, None)),
+                Some(shown) => match follow(
+                    &mut drm,
+                    id,
+                    &found.modes,
+                    size,
+                    shown.mode,
+                    requested_refresh,
+                ) {
                     Ok(Follow::Run(mode, scaling)) => Some((mode, scaling)),
                     Ok(Follow::Dark { smaller: dark }) => {
                         smaller += usize::from(dark);
@@ -1370,6 +1433,7 @@ impl<D: Drm> Display<D> {
             edid,
             preferred,
             rates,
+            requested_refresh,
             smaller,
             refused: refused.or(display.refused),
             ..display
@@ -1423,6 +1487,7 @@ impl<D: Drm> Display<D> {
             dark: false,
             power: None,
             rates: Vec::new(),
+            requested_refresh: None,
             retime: None,
         };
         if let Err(error) = display.set_mode(0) {
@@ -1672,12 +1737,22 @@ impl<D: Drm> Display<D> {
                     .find(|mode| size_of_mode(mode) == size && refresh(mode) == refresh(&ran))
             })
             .copied()
-            .or_else(|| mode_of(&found.modes, size, &|_, _, _| true));
+            .or_else(|| match self.requested_refresh {
+                Some(hertz) => mode_at(&found.modes, size, hertz, &|_, _, _| true),
+                None => mode_of(&found.modes, size, &|_, _, _| true),
+            });
         // Every head's mode is of the display's size, so the one it ran
         // serves as a scaled picture's timing.
         let (mode, scaling) = match own {
             Some(mode) => (mode, None),
-            None => match follow(&mut self.drm, connector, &found.modes, size, ran)? {
+            None => match follow(
+                &mut self.drm,
+                connector,
+                &found.modes,
+                size,
+                ran,
+                self.requested_refresh,
+            )? {
                 Follow::Run(mode, scaling) => (mode, scaling),
                 Follow::Dark { smaller } => return Ok(Restore::NoMode { smaller }),
             },
@@ -1715,7 +1790,14 @@ impl<D: Drm> Display<D> {
             return Ok(Joined::Dark { smaller: false });
         };
         let size = (self.width, self.height);
-        let (mode, scaling) = match follow(&mut self.drm, id, &found.modes, size, shown.mode)? {
+        let (mode, scaling) = match follow(
+            &mut self.drm,
+            id,
+            &found.modes,
+            size,
+            shown.mode,
+            self.requested_refresh,
+        )? {
             Follow::Run(mode, scaling) => (mode, scaling),
             Follow::Dark { smaller } => return Ok(Joined::Dark { smaller }),
         };

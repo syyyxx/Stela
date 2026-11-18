@@ -76,14 +76,28 @@ impl ParseState<'_> {
                 options.guest_pes = Some(count);
             }
             DISPLAY_SIZE => {
-                let size = value().ok_or(Error::DisplaySize)?;
+                let value = value().ok_or(Error::DisplaySize)?;
+                let (size, refresh_hz) = match value.split_once('@') {
+                    Some((size, refresh)) => {
+                        let refresh = refresh.parse::<u32>().map_err(|_| Error::DisplaySize)?;
+                        if refresh == 0 || refresh.checked_mul(1_000).is_none() {
+                            return Err(Error::DisplaySize);
+                        }
+                        (size, Some(refresh))
+                    }
+                    None => (value, None),
+                };
                 let (width, height) = size.split_once('x').ok_or(Error::DisplaySize)?;
                 let width = width.parse::<u32>().map_err(|_| Error::DisplaySize)?;
                 let height = height.parse::<u32>().map_err(|_| Error::DisplaySize)?;
                 if width == 0 || height == 0 {
                     return Err(Error::DisplaySize);
                 }
-                options.display_size = Some((width, height));
+                options.display_size = Some(DisplaySize {
+                    width,
+                    height,
+                    refresh_hz,
+                });
             }
             "--restore-study" => options.restore = true,
             "--restore-source" => {

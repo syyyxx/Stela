@@ -459,6 +459,67 @@ fn the_firmwares_size_wins_then_the_preferred_mode() {
     assert_eq!(choose(&[], Wanted::Size((800, 600)), any), None);
 }
 
+#[test]
+fn a_requested_refresh_matches_the_closest_listed_progressive_timing() {
+    let fast = outputs::at(1920, 1080, 0, 120);
+    let exact = outputs::at(1920, 1080, 0, 60);
+    let fractional = ModeInfo {
+        clock: 148_352,
+        timing_h: [2008, 2052, 2200, 0],
+        timing_v: [1084, 1089, 1125, 0],
+        ..exact
+    };
+    let interlaced = ModeInfo {
+        flags: INTERLACED,
+        ..exact
+    };
+    let explicit = Wanted::SizeAtRefresh((1920, 1080), 60);
+    let any: Fits<'_> = &|_, _, _| true;
+    assert_eq!(refresh(&fractional), 59_940);
+    assert_eq!(
+        choose(&[fast, interlaced, fractional], explicit, any),
+        Some(fractional)
+    );
+    assert_eq!(
+        choose(&[fast, fractional, exact], explicit, any),
+        Some(exact)
+    );
+    assert_eq!(choose(&[fast, interlaced], explicit, any), None);
+    assert_eq!(choose(&[exact], explicit, &|_, _, _| false), None);
+}
+
+#[test]
+fn a_display_taken_at_a_requested_refresh_does_not_switch_to_the_faster_mode() {
+    let fast = outputs::at(2, 2, PREFERRED, 120);
+    let standard = outputs::at(2, 2, 0, 60);
+    let wanted = Wanted::SizeAtRefresh((2, 2), 60);
+    let fits: Fits<'_> = &|_, _, _| true;
+
+    let mut unsupported = Card::new(vec![fast]);
+    assert!(matches!(
+        Display::take_fitting(&mut unsupported, wanted, fits),
+        Err(Error::ModeUnavailable)
+    ));
+    assert_eq!(unsupported.mode_sets, 0);
+
+    let mut card = Card::new(vec![fast, standard]);
+    let mut display = Display::take_fitting(&mut card, wanted, fits).unwrap();
+    assert_eq!(display.drm.set.map(|(mode, _)| mode), Some(standard));
+    assert_eq!(display.refresh_rates(), vec![60_000]);
+    assert_eq!(display.set_refresh(120_000), Err(Error::NoRate));
+
+    // Reconnecting a monitor that lists only 120 Hz must not switch to it.
+    display.drm.connected = false;
+    assert_eq!(display.watch().lost, 1);
+    display.drm.modes = vec![fast];
+    display.drm.connected = true;
+    let sets = display.drm.mode_sets;
+    for _ in 0..RESTORE_TRIES {
+        display.watch();
+    }
+    assert_eq!(display.drm.mode_sets, sets);
+}
+
 /// Before the guest's mode is set the monitor's own mode wins: its fastest
 /// of the preferred size that fits, then the firmware's size.
 #[test]
