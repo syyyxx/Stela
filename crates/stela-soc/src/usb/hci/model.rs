@@ -35,6 +35,17 @@
 //! 0x1001f1068 and gated at 0x100196974..0x1001969d4), so the bitmap below
 //! decides what it asks. Vendor commands have no bit and are always sent.
 //!
+//! bluetoothd decides how to scan before it reads the controller: its scan
+//! capabilities (low-power core 0x100391848, scan core 0x100391828, vendor
+//! scan parameters 0x1003918bc) are taken once in its stack start
+//! (0x10058ed98..0x10058ee14) from the chipset the board's device type names
+//! (MobileGestalt; BCM_4388 here), and the chipset Read Verbose Config gives
+//! later (0x10058f1fc) clears them only for a third-party dongle
+//! (0x10058f288). So on this board it scans with Apple's multi-core scan
+//! commands whatever chip the module reports, and the model answers the two
+//! it sends, 0xFE37 and 0xFE29; an Unknown HCI Command there restarted the
+//! daemon ("Scan stopped improperly with result 701 -- restart").
+//!
 //! The controller never has a connection, so ACL data from the host names no
 //! connection: it is discarded, counted, and its buffer returned with
 //! Number Of Completed Packets, which keeps the host's flow control whole.
@@ -120,13 +131,39 @@ enum Returns {
     Silent,
 }
 
+/// How long a command's parameters are.
+#[derive(Clone, Copy)]
+enum Length {
+    Fixed(usize),
+    /// A count, then that many handle and count pairs (Host Number Of
+    /// Completed Packets).
+    Handles,
+    /// Apple's multi-core LE scan parameters: five bytes, then seven for
+    /// each scanning PHY the third byte names in its low three bits.
+    ScanCores,
+}
+
+impl Length {
+    fn matches(self, p: &[u8]) -> bool {
+        match self {
+            Self::Fixed(length) => p.len() == length,
+            Self::Handles => p
+                .first()
+                .is_some_and(|&n| p.len() == 1 + 4 * usize::from(n)),
+            Self::ScanCores => p
+                .get(2)
+                .is_some_and(|&phys| p.len() == 5 + 7 * (phys & 0x07).count_ones() as usize),
+        }
+    }
+}
+
 /// One implemented command: its Supported Commands octet and bit (Vol 4
 /// Part E 6.27; `None` for a vendor command, which has none), its parameter
-/// length (`None`: variable) and what it returns.
+/// length and what it returns.
 struct Command {
     opcode: u16,
     support: Option<(u8, u8)>,
-    parameters: Option<usize>,
+    parameters: Length,
     returns: Returns,
 }
 
@@ -134,21 +171,22 @@ const fn command(opcode: u16, octet: u8, bit: u8, parameters: usize, returns: Re
     Command {
         opcode,
         support: Some((octet, bit)),
-        parameters: Some(parameters),
+        parameters: Length::Fixed(parameters),
         returns,
     }
 }
 
 /// A Broadcom vendor command (OGF 0x3F).
-const fn vendor(opcode: u16, parameters: usize, returns: usize) -> Command {
+const fn vendor(opcode: u16, parameters: Length, returns: usize) -> Command {
     Command {
         opcode,
         support: None,
-        parameters: Some(parameters),
+        parameters,
         returns: Returns::Complete(returns),
     }
 }
 
+use Length::{Fixed, ScanCores};
 use Returns::{Complete, Status};
 
 /// Every command the model implements. The octets and bits match bluetoothd's
@@ -191,7 +229,7 @@ const COMMANDS: &[Command] = &[
     Command {
         opcode: 0x0c35, // Host Number Of Completed Packets
         support: Some((10, 7)),
-        parameters: None,
+        parameters: Length::Handles,
         returns: Returns::Silent,
     },
     command(0x0c42, 12, 4, 0, Complete(1)), // Read Inquiry Scan Type
@@ -237,10 +275,14 @@ const COMMANDS: &[Command] = &[
     command(0x2012, 27, 1, 7, Complete(0)), // LE Remove Device From Filter Accept List
     command(0x201c, 28, 3, 0, Complete(8)), // LE Read Supported States
     // Broadcom vendor commands (Linux `drivers/bluetooth/btbcm.c`).
-    vendor(0xfc01, 6, 0), // Write BD_ADDR (`btbcm_set_bdaddr`)
-    vendor(0xfc5a, 0, 4), // Read USB Product (`btbcm_read_usb_product`)
-    vendor(0xfc6e, 0, 8), // Read Controller Features (`btbcm_read_controller_features`)
-    vendor(0xfc79, 0, 6), // Read Verbose Config Version Info (`btbcm_read_verbose_config`)
+    vendor(0xfc01, Fixed(6), 0), // Write BD_ADDR (`btbcm_set_bdaddr`)
+    vendor(0xfc5a, Fixed(0), 4), // Read USB Product (`btbcm_read_usb_product`)
+    vendor(0xfc6e, Fixed(0), 8), // Read Controller Features (`btbcm_read_controller_features`)
+    vendor(0xfc79, Fixed(0), 6), // Read Verbose Config Version Info (`btbcm_read_verbose_config`)
+    // Apple's multi-core LE scan (bluetoothd 26B123 `_BCM_OlympicLESetScanEnable`
+    // and `_BCM_OlympicLESetScanParametersMultiCore`): see `execute`.
+    vendor(0xfe29, Fixed(9), 0),
+    vendor(0xfe37, ScanCores, 0),
 ];
 
 /// Whether the model implements `opcode`.
@@ -570,13 +612,7 @@ impl Model {
                 Answer::Complete(vec![UNKNOWN_COMMAND])
             }
             Some(command) => {
-                let length_ok = match command.parameters {
-                    Some(length) => p.len() == length,
-                    None => p
-                        .first()
-                        .is_some_and(|&n| p.len() == 1 + 4 * usize::from(n)),
-                };
-                let answer = if length_ok {
+                let answer = if command.parameters.matches(p) {
                     self.execute(opcode, p, now, &mut later)
                 } else {
                     match command.returns {
@@ -1068,6 +1104,34 @@ impl Model {
             // parser (0x1001b6a6c) reads exactly these six bytes and Linux
             // requires seven with the status.
             0xfc79 => ok(&[CHIP_ID, 0, 0, 0, 0, 0]),
+            // Multi-core LE Set Scan Parameters (builder 0x1001ce040): own
+            // address type, filter policy, scanning PHYs, then the number
+            // of cores (low two bits), the core it sets (1, 2, 4 or 8),
+            // and for each PHY the scan type, interval, window and a
+            // 16-bit core value, as LE Set Extended Scan Parameters lays
+            // them out with the core fields added. Its completion
+            // (0x1001b156c) reads the status alone.
+            0xfe37 => {
+                if p[0] > 3 || p[1] > 3 || !matches!(p[4], 1 | 2 | 4 | 8) {
+                    return fail(INVALID_PARAMETERS);
+                }
+                if p.len() > 5 {
+                    (s.scan_kind, s.scan_own_type, s.scan_filter_policy) = (p[5], p[0], p[1]);
+                }
+                ok(&[])
+            }
+            // Multi-core LE Set Scan Enable (builder 0x1001cdc30): flags
+            // (bit 0 enables, bit 1 filters duplicates), cores, two core
+            // settings, the cores to run (bits 0-3), two 16-bit values.
+            // bluetoothd stops a multi-core scan with this command too
+            // (0x1002585c8, flags 0). Its completion reads the status alone.
+            0xfe29 => {
+                if p[4] > 0x0f {
+                    return fail(INVALID_PARAMETERS);
+                }
+                s.scanning = (p[0] & 1 != 0).then_some(p[0] >> 1 & 1);
+                ok(&[])
+            }
             _ => unreachable!("every listed command has a case"),
         }
     }

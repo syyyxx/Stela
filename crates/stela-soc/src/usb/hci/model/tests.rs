@@ -138,6 +138,68 @@ fn bluetoothd_bring_up_completes_in_order() {
         assert_eq!((status, returns.len()), (UNKNOWN_COMMAND, 0));
     }
     assert_eq!(model.take_unknown().len(), 7);
+    // Before PoweredOn (VM round 3): LE meta enable features (5 bytes),
+    // the Olympic completed-packets threshold (8), the extended duplicate
+    // filter (3) and the advertising PCF feature select (14). bluetoothd
+    // logs each "completed with status 701" and goes on.
+    for (opcode, length) in [(0xfce9, 5), (0xfce2, 8), (0xfd47, 3), (0xfce9, 14)] {
+        let (status, _) = complete(&run(&mut model, opcode, &vec![0; length]), opcode);
+        assert_eq!(status, UNKNOWN_COMMAND);
+    }
+    assert_eq!(model.take_unknown(), [0xfce9, 0xfce2, 0xfd47]);
+    // The first LE scan: this board's scan capabilities send the main core's
+    // parameters with the multi-core command (LE_StartScan 0x100257c2c): a
+    // public own address, no filter, the 1M PHY, two cores, core 1, then
+    // passive 300 ms / 30 ms and the core value 30. Its completion
+    // (leScanParamsLPCoreCb 0x100258108) fails the scan on any error, and
+    // the failed scan restarts the daemon with reason 701.
+    let main = [0, 0, 1, 2, 1, 0, 0xe0, 0x01, 0x30, 0x00, 0x1e, 0x00];
+    ok(&mut model, 0xfe37, &main);
+    // The scan core's parameters follow when it has a window (0x100258340,
+    // core 2); round 3 had none.
+    let scan_core = [0, 0, 1, 2, 2, 0, 0x50, 0x00, 0x10, 0x00, 0x1e, 0x00];
+    ok(&mut model, 0xfe37, &scan_core);
+    assert_eq!(model.air().scanning, None, "parameters start nothing");
+    // leScanParamsCb (0x10025999c): enable with the duplicate filter, two
+    // cores, the main core's bit.
+    ok(&mut model, 0xfe29, &[0b11, 2, 0, 0, 1, 0, 0, 0, 0]);
+    assert_eq!(model.air().scanning, Some((0, 1)));
+    assert!(model.advance(u64::MAX).is_empty(), "nothing in range");
+    // LE_StopScan (0x1002585c8): flags 0 on both cores.
+    ok(&mut model, 0xfe29, &[0, 2, 0, 0, 3, 0, 0, 0, 0]);
+    assert_eq!(model.air().scanning, None);
+    assert!(model.take_unknown().is_empty());
+}
+
+/// The multi-core scan commands check what the controller can check: the
+/// parameter length the PHY bits give, the core, the core bits.
+#[test]
+fn the_multi_core_scan_commands_check_their_lengths_and_cores() {
+    let mut model = Model::new(ADDRESS);
+    // Two PHYs (1M and coded) take two seven-byte entries.
+    let mut two = vec![0, 0, 0b101, 1, 2];
+    two.extend_from_slice(&[1, 0x60, 0, 0x30, 0, 0x1e, 0, 1, 0x60, 0, 0x30, 0, 0x1e, 0]);
+    ok(&mut model, 0xfe37, &two);
+    for bad in [
+        &two[..12],
+        &[0, 0, 1, 1, 3, 0, 0x60, 0, 0x30, 0, 0x1e, 0][..],
+    ] {
+        let (status, returns) = complete(&run(&mut model, 0xfe37, bad), 0xfe37);
+        assert_eq!((status, returns.len()), (INVALID_PARAMETERS, 0));
+    }
+    let (status, _) = complete(&run(&mut model, 0xfe29, &[1; 8]), 0xfe29);
+    assert_eq!(status, INVALID_PARAMETERS);
+    let (status, _) = complete(
+        &run(&mut model, 0xfe29, &[1, 1, 0, 0, 0x10, 0, 0, 0, 0]),
+        0xfe29,
+    );
+    assert_eq!(status, INVALID_PARAMETERS);
+    assert_eq!(model.air().scanning, None);
+    for opcode in [0xfe29, 0xfe37] {
+        assert!(implements(opcode));
+        assert!(!supported(opcode));
+    }
+    assert!(model.take_unknown().is_empty());
 }
 
 #[test]
