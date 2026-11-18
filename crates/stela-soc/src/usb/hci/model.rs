@@ -839,7 +839,11 @@ impl Model {
                     0 => LMP_FEATURES,
                     // Host features: SSP and LE as the host wrote them.
                     1 => u64::from(s.simple_pairing) | u64::from(s.le_host) << 1,
-                    _ => return fail(INVALID_PARAMETERS),
+                    // A page past the last with a set bit has none set.
+                    // bluetoothd reads page 2 whatever the maximum says
+                    // (26B123 0x100193e8c) and fails its bring-up on an
+                    // error (0x100195af8).
+                    _ => 0,
                 };
                 let mut r = vec![p[0], MAX_FEATURE_PAGE];
                 r.extend_from_slice(&features.to_le_bytes());

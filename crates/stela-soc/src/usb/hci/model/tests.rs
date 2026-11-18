@@ -50,65 +50,70 @@ fn supported(opcode: u16) -> bool {
 }
 
 /// bluetoothd's HCI bring-up on the USB transport, replayed step by step
-/// from its step table (26B123: 0x100b38f70, entries 15 to 43) with the
+/// from its step table (26B123: 0x100b38f70, entries 1 to 31) with the
 /// parameters it sends. Each standard command is gated on its Supported
 /// Commands bit; the Broadcom ones on the chipset the USB transport sets.
+/// A failed reply to any step without its own tolerance ends the bring-up
+/// with "HCI initialization failed" (reason 108).
 #[test]
 fn bluetoothd_bring_up_completes_in_order() {
     let mut model = Model::new(ADDRESS);
-    // [15] Write BD_ADDR, sent only when the platform stored an address.
+    // [1] Write BD_ADDR, sent only when the platform stored an address.
     ok(&mut model, 0xfc01, &[6, 5, 4, 3, 2, 0x42]);
     assert_eq!(ok(&mut model, 0x1009, &[]), [6, 5, 4, 3, 2, 0x42]);
-    // [18] Reset keeps an address written by the vendor command.
+    // [4] Reset keeps an address written by the vendor command.
     ok(&mut model, 0x0c03, &[]);
     assert_eq!(ok(&mut model, 0x1009, &[]), [6, 5, 4, 3, 2, 0x42]);
     model.power_on();
-    // [19] Read Verbose Config Version Info: chip id, target, build base,
+    // [5] Read Verbose Config Version Info: chip id, target, build base,
     // build number (0x1001b6a6c reads six bytes; Linux btbcm.c:333-351
     // expects seven with the status).
     let verbose = ok(&mut model, 0xfc79, &[]);
     assert_eq!(verbose, [CHIP_ID, 0, 0, 0, 0, 0]);
-    // [20] Read Local Version Information.
+    // [6] Read Local Version Information.
     let version = ok(&mut model, 0x1001, &[]);
     assert_eq!(version, [HCI_VERSION, 0, 0, LMP_VERSION, 15, 0, 0x0e, 0x41]);
-    // [21] Supported Commands, [22] BD_ADDR, [23] Features, [24] page 1.
+    // [7] Supported Commands, [8] BD_ADDR, [9] Features.
     let commands = ok(&mut model, 0x1002, &[]);
     assert_eq!(commands, supported_commands());
     assert_eq!(ok(&mut model, 0x1009, &[]), ADDRESS);
     let features = ok(&mut model, 0x1003, &[]);
     assert_eq!(features, LMP_FEATURES.to_le_bytes());
     assert_ne!(features[4] & 1 << 6, 0, "LE supported (controller)");
+    assert_ne!(features[6] & 1 << 3, 0, "SSP (controller)");
     assert_ne!(features[7] & 1 << 7, 0, "extended features");
-    let page = ok(&mut model, 0x1004, &[1]);
-    assert_eq!(page[..2], [1, MAX_FEATURE_PAGE]);
-    assert_eq!(page[2], 0, "the host enabled nothing yet");
-    // [25] LE features.
+    // [10] Extended features page 2 (0x100193e8c), whatever the maximum:
+    // its callback (0x100195af8) fails the bring-up on any error status.
+    let page = ok(&mut model, 0x1004, &[2]);
+    assert_eq!(page, [2, MAX_FEATURE_PAGE, 0, 0, 0, 0, 0, 0, 0, 0]);
+    // [11] LE features (0x2003; 0x2087 has no bit).
     assert_eq!(ok(&mut model, 0x2003, &[]), [0; 8]);
-    // [26] Set Event Mask; [27] page 2 is sent only from LMP version 12.
+    // [12] Set Event Mask; [13] page 2 is sent only from LMP version 12.
     ok(
         &mut model,
         0x0c01,
         &[0xff, 0xff, 0xfb, 0xff, 0x07, 0xf8, 0xbf, 0x3d],
     );
     const { assert!(LMP_VERSION < 12) };
-    // [28] LE Set Event Mask, [29] SSP, [30] LE Host Supported.
+    // [14] LE Set Event Mask (LMP 6 or later), [15] SSP mode 1
+    // (0x100ba615c), [16] LE Host Supported 1.
     ok(&mut model, 0x2001, &[0x1f, 0, 0, 0, 0, 0, 0, 0]);
     ok(&mut model, 0x0c56, &[1]);
     ok(&mut model, 0x0c6d, &[1, 0]);
     assert_eq!(ok(&mut model, 0x1004, &[1])[2], 0b11, "SSP and LE host");
-    // [31] LE buffer size (v1), [33] LE states, [34] accept list size.
+    // [17] LE buffer size (v1), [19] LE states, [20] accept list size.
     assert_eq!(ok(&mut model, 0x2002, &[]), [251, 0, LE_ACL_BUFFERS]);
     assert_eq!(ok(&mut model, 0x201c, &[]), LE_STATES.to_le_bytes());
     assert_eq!(ok(&mut model, 0x200f, &[]), [ACCEPT_LIST_SIZE as u8]);
-    // [35] Read Buffer Size, [39] Host Buffer Size, [40] Flow Control.
+    // [21] Read Buffer Size, [25] Host Buffer Size, [26] Flow Control.
     assert_eq!(ok(&mut model, 0x1005, &[]), [0xfd, 0x03, 0, 8, 0, 0, 0]);
     ok(&mut model, 0x0c33, &[0xfd, 0x03, 0, 8, 0, 0, 0]);
     ok(&mut model, 0x0c31, &[1]);
-    // [41] Write Default Erroneous Data Reporting (Broadcom chipsets).
-    ok(&mut model, 0x0c5b, &[0]);
-    // Steps bluetoothd takes only when their bits are set: none is.
-    // [25] v2 features 0x2087, [31] v2 buffer 0x2060, [32] 0x202f,
-    // [36][37][43] 0x2074, [38] 0x207d, [42] 0x20a2.
+    // [27] Write Default Erroneous Data Reporting 1 (Broadcom chipsets).
+    ok(&mut model, 0x0c5b, &[1]);
+    // Steps that bluetoothd skips on a clear bit, each tolerating 0x274:
+    // [17] v2 buffer 0x2060, [18] 0x202f, [22][23][29] 0x2074, [24] 0x207d,
+    // [28] 0x20a2; [11] v2 features 0x2087 is chosen by an LE feature bit.
     for optional in [0x2060, 0x2074, 0x202f, 0x207d, 0x2087, 0x20a2] {
         assert!(!supported(optional), "{optional:#06x}");
         assert!(!implements(optional));
@@ -133,6 +138,20 @@ fn bluetoothd_bring_up_completes_in_order() {
         assert_eq!((status, returns.len()), (UNKNOWN_COMMAND, 0));
     }
     assert_eq!(model.take_unknown().len(), 7);
+}
+
+#[test]
+fn every_extended_features_page_answers_and_pages_past_the_maximum_are_empty() {
+    let mut model = Model::new(ADDRESS);
+    assert_eq!(
+        ok(&mut model, 0x1004, &[0])[2..],
+        LMP_FEATURES.to_le_bytes()
+    );
+    for page in [MAX_FEATURE_PAGE + 1, 0xff] {
+        let returns = ok(&mut model, 0x1004, &[page]);
+        assert_eq!(returns[..2], [page, MAX_FEATURE_PAGE]);
+        assert_eq!(returns[2..], [0; 8]);
+    }
 }
 
 /// The Broadcom commands Linux sends an Apple module (btbcm.c
