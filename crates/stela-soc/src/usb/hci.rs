@@ -98,8 +98,85 @@ const COMMAND_HEADER: usize = 3;
 const ACL_HEADER: usize = 4;
 const VENDOR_GROUP: u16 = 0x3f;
 const COMMAND_COMPLETE: u8 = 0x0e;
+const COMMAND_STATUS: u8 = 0x0f;
+const HCI_RESET: u16 = 0x0c03;
+/// Commands traced after each configuration or HCI Reset, for the owner's
+/// log.
+pub const TRACED_COMMANDS: u16 = 48;
+/// HCI Resets that start the trace again after each configuration: a
+/// daemon that restarts begins each bring-up with one and need not
+/// configure the function again.
+const TRACED_BRING_UPS: u8 = 4;
+/// Trace entries held until the owner takes them; later ones are dropped.
+const TRACE_ENTRIES: usize = 64;
 /// HCI error 0x01 (Vol 1 Part F 1.3).
 const UNKNOWN_COMMAND: u8 = 0x01;
+
+/// What the owner's log says of the function: the guest's first commands
+/// after it configures the function, and its resets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Traced {
+    /// A command the model answered: its opcode and parameter length, and
+    /// the event that answered it, if any, with its status and the length
+    /// of its return parameters after the status.
+    Command {
+        opcode: u16,
+        parameters: u8,
+        answer: Option<Answered>,
+    },
+    /// The guest set the configuration to this value (0: unconfigured).
+    Configured(u8),
+    /// A USB bus reset.
+    Reset,
+    /// [`TRACED_COMMANDS`] commands were traced; an HCI Reset or the next
+    /// configuration starts again.
+    Ended,
+}
+
+/// The event that answered a traced command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Answered {
+    /// Command Complete or Command Status.
+    pub event: u8,
+    pub status: u8,
+    pub returns: u8,
+}
+
+impl core::fmt::Display for Traced {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            Self::Command {
+                opcode,
+                parameters,
+                answer,
+            } => {
+                write!(f, "command {opcode:#06x} parameters={parameters} ")?;
+                match answer {
+                    Some(Answered {
+                        event,
+                        status,
+                        returns,
+                    }) => {
+                        let kind = if event == COMMAND_STATUS {
+                            "status"
+                        } else {
+                            "complete"
+                        };
+                        write!(f, "answered {kind} status={status:#04x} returns={returns}")
+                    }
+                    None => f.write_str("answered with no event"),
+                }
+            }
+            Self::Configured(0) => f.write_str("unconfigured"),
+            Self::Configured(value) => write!(f, "configured {value}"),
+            Self::Reset => f.write_str("bus reset"),
+            Self::Ended => write!(
+                f,
+                "trace ends after {TRACED_COMMANDS} commands until the next HCI Reset or configuration"
+            ),
+        }
+    }
+}
 
 /// What the guest sent for the host's controller.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,6 +257,14 @@ struct State {
     model: Option<Box<model::Model>>,
     /// The system count of the latest transactions.
     now: u64,
+    /// The owner's log, until taken.
+    trace: Vec<Traced>,
+    /// Commands still traced since the last configuration.
+    tracing: u16,
+    /// The configuration value last traced.
+    configured: u8,
+    /// HCI Resets that may still start the trace again.
+    bring_ups: u8,
 }
 
 /// The function: its pipes and queues.
@@ -323,6 +408,10 @@ impl Hci {
                 counters: Counters::default(),
                 model,
                 now: 0,
+                trace: Vec::new(),
+                tracing: 0,
+                configured: 0,
+                bring_ups: 0,
             },
         }
     }
@@ -356,6 +445,11 @@ impl Hci {
             .as_mut()
             .map(|model| model.take_unknown())
             .unwrap_or_default()
+    }
+
+    /// The function's trace since it was last taken.
+    pub fn take_trace(&mut self) -> Vec<Traced> {
+        core::mem::take(&mut self.state.trace)
     }
 
     /// The next packet the guest sent for the host's controller.
@@ -395,6 +489,12 @@ impl Default for Hci {
 }
 
 impl State {
+    fn trace(&mut self, entry: Traced) {
+        if self.trace.len() < TRACE_ENTRIES {
+            self.trace.push(entry);
+        }
+    }
+
     fn event(&mut self, packet: Vec<u8>) {
         if self.events.queue.len() >= QUEUE_PACKETS {
             self.counters.overflowed += 1;
@@ -412,7 +512,38 @@ impl State {
         if !model::implements(u16::from_le_bytes([packet[0], packet[1]])) {
             self.counters.unknown += 1;
         }
+        let opcode = u16::from_le_bytes([packet[0], packet[1]]);
+        if opcode == HCI_RESET && self.bring_ups > 0 {
+            self.bring_ups -= 1;
+            self.tracing = TRACED_COMMANDS;
+        }
         let events = model.command(packet, self.now);
+        if self.tracing > 0 {
+            self.tracing -= 1;
+            // The first event answers the command; a procedure's later
+            // ones follow it.
+            let answer = events.first().and_then(|e| match e[..] {
+                [COMMAND_COMPLETE, length, _, _, _, status, ..] => Some(Answered {
+                    event: COMMAND_COMPLETE,
+                    status,
+                    returns: length.saturating_sub(4),
+                }),
+                [COMMAND_STATUS, _, status, ..] => Some(Answered {
+                    event: COMMAND_STATUS,
+                    status,
+                    returns: 0,
+                }),
+                _ => None,
+            });
+            self.trace(Traced::Command {
+                opcode,
+                parameters: packet[2],
+                answer,
+            });
+            if self.tracing == 0 {
+                self.trace(Traced::Ended);
+            }
+        }
         events.into_iter().for_each(|e| self.event(e));
     }
 
@@ -494,7 +625,16 @@ impl State {
 }
 
 impl Requests for State {
-    fn configure(&mut self, _value: u8) -> Result<(), Stall> {
+    fn configure(&mut self, value: u8) -> Result<(), Stall> {
+        if value != self.configured {
+            self.configured = value;
+            self.trace(Traced::Configured(value));
+        }
+        (self.tracing, self.bring_ups) = if value == 0 {
+            (0, 0)
+        } else {
+            (TRACED_COMMANDS, TRACED_BRING_UPS)
+        };
         self.halted = [false; 3];
         self.sco_setting = 0;
         self.outbound.clear();
@@ -555,6 +695,7 @@ impl Requests for State {
 
 impl BusPeer for Hci {
     fn reset(&mut self) -> Result<()> {
+        self.state.trace(Traced::Reset);
         // A bus reset powers the controller up again.
         if let Some(model) = self.state.model.as_mut() {
             model.power_on();
@@ -922,6 +1063,99 @@ mod tests {
             [vec![0x13, 5, 1, 1, 0, 1, 0]]
         );
         assert_eq!(hci.counters().acl_discarded, 1);
+    }
+
+    /// The owner's log: the first commands after each configuration with
+    /// their answers, then one end line, and each reset and configuration.
+    #[test]
+    fn the_trace_names_the_first_commands_after_each_configuration() {
+        let mut hci = modeled();
+        assert_eq!(hci.take_trace(), [Traced::Configured(1)]);
+        command(&mut hci, &[0x03, 0x0c, 0]).unwrap();
+        command(&mut hci, &[0x04, 0x10, 1, 2]).unwrap();
+        command(&mut hci, &[0x4c, 0xfc, 1, 9]).unwrap();
+        command(&mut hci, &[0x01, 0x04, 5, 0x33, 0x8b, 0x9e, 1, 0]).unwrap();
+        command(&mut hci, &[0x35, 0x0c, 5, 1, 0x40, 0, 1, 0]).unwrap();
+        let complete = |status, returns| {
+            Some(Answered {
+                event: COMMAND_COMPLETE,
+                status,
+                returns,
+            })
+        };
+        let traced = hci.take_trace();
+        assert_eq!(
+            traced,
+            [
+                Traced::Command {
+                    opcode: 0x0c03,
+                    parameters: 0,
+                    answer: complete(0, 0),
+                },
+                Traced::Command {
+                    opcode: 0x1004,
+                    parameters: 1,
+                    answer: complete(0, 10),
+                },
+                Traced::Command {
+                    opcode: 0xfc4c,
+                    parameters: 1,
+                    answer: complete(UNKNOWN_COMMAND, 0),
+                },
+                Traced::Command {
+                    opcode: 0x0401,
+                    parameters: 5,
+                    answer: Some(Answered {
+                        event: COMMAND_STATUS,
+                        status: 0,
+                        returns: 0,
+                    }),
+                },
+                Traced::Command {
+                    opcode: 0x0c35,
+                    parameters: 5,
+                    answer: None,
+                },
+            ]
+        );
+        assert_eq!(
+            traced[1].to_string(),
+            "command 0x1004 parameters=1 answered complete status=0x00 returns=10"
+        );
+        assert_eq!(
+            traced[4].to_string(),
+            "command 0x0c35 parameters=5 answered with no event"
+        );
+        // The trace ends after its commands, once.
+        let read_address = |hci: &mut Hci, count: u16| {
+            for _ in 0..count {
+                command(hci, &[0x09, 0x10, 0]).unwrap();
+                read(hci, EVENTS, EVENT_PACKET);
+            }
+        };
+        read_address(&mut hci, TRACED_COMMANDS - 1);
+        let traced = hci.take_trace();
+        assert_eq!(traced.len(), usize::from(TRACED_COMMANDS) - 5 + 1);
+        assert_eq!(traced.last(), Some(&Traced::Ended));
+        // An HCI Reset starts it again, a bounded number of times: the
+        // first command above was one.
+        for _ in 1..TRACED_BRING_UPS {
+            command(&mut hci, &[0x03, 0x0c, 0]).unwrap();
+            read(&mut hci, EVENTS, EVENT_PACKET);
+            read_address(&mut hci, TRACED_COMMANDS - 1);
+            assert_eq!(hci.take_trace().len(), usize::from(TRACED_COMMANDS) + 1);
+        }
+        command(&mut hci, &[0x03, 0x0c, 0]).unwrap();
+        assert!(hci.take_trace().is_empty());
+        // A bus reset and a new configuration start it again.
+        hci.reset().unwrap();
+        assert_eq!(hci.take_trace(), [Traced::Reset, Traced::Configured(0)]);
+        let mut hci = configured(hci);
+        command(&mut hci, &[0x03, 0x0c, 0]).unwrap();
+        let traced = hci.take_trace();
+        assert_eq!(traced[0], Traced::Configured(1));
+        assert_eq!(traced.len(), 2);
+        assert_eq!(Traced::Reset.to_string(), "bus reset");
     }
 
     #[test]

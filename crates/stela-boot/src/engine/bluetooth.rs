@@ -7,8 +7,10 @@
 //! The guest is given the controller model (`stela_soc::usb::hci::model`),
 //! presented as Apple's internal USB module, which answers inside the
 //! guest's function; a host controller is not lent yet (`start`). This
-//! reports the model's unknown commands, each once, and how many commands
-//! the guest sent, at each doubling.
+//! reports the model's unknown commands, each once, how many commands the
+//! guest sent, at each doubling, and the function's trace: each
+//! configuration and reset, and the first commands after each
+//! configuration with their answers.
 //!
 //! One controller serves the guest; others are reported and left idle. A
 //! controller that fails is reported once, and the guest's commands then get
@@ -27,7 +29,9 @@ use stela_drivers::{
     probe::native::{Bcm4377, IntelBluetooth, PcieController, PcieHci},
     usb::bluetooth::{Packet, UsbHci},
 };
-use stela_soc::machine::{AppleDevices, Outbound, UsbBluetooth, UsbBluetoothCounters};
+use stela_soc::machine::{
+    AppleDevices, Outbound, UsbBluetooth, UsbBluetoothCounters, UsbBluetoothTrace,
+};
 
 enum Controller {
     Usb(Box<UsbHci>),
@@ -55,6 +59,8 @@ pub struct HostBluetooth {
     unknown: Vec<u16>,
     /// The command count reported last.
     reported_commands: u64,
+    /// The guest function's trace, to report.
+    trace: Vec<UsbBluetoothTrace>,
 }
 
 /// The controller is dropped in the loader's root. An install runs without
@@ -102,6 +108,7 @@ impl HostBluetooth {
             failed: false,
             unknown: Vec::new(),
             reported_commands: 0,
+            trace: Vec::new(),
         })
     }
 
@@ -117,6 +124,7 @@ impl HostBluetooth {
             failed: false,
             unknown: Vec::new(),
             reported_commands: 0,
+            trace: Vec::new(),
         }
     }
 
@@ -137,6 +145,7 @@ impl HostBluetooth {
         if matches!(self.controller, Controller::Modeled) {
             self.unknown.extend(devices.bluetooth_unknown());
         }
+        self.trace.extend(devices.bluetooth_trace());
         let packets = core::iter::from_fn(|| devices.bluetooth_take()).collect();
         (
             packets,
@@ -156,6 +165,11 @@ impl HostBluetooth {
 
     /// Reports the guest's controller going up or down.
     pub fn status(&mut self, status: Option<(bool, UsbBluetoothCounters)>) {
+        // Bounded by the function: its first commands after each
+        // configuration, and its resets.
+        for entry in self.trace.drain(..) {
+            output::arguments(format_args!("GUEST BLUETOOTH {entry}\n"));
+        }
         for opcode in self.unknown.drain(..) {
             output::arguments(format_args!(
                 "BLUETOOTH model: unknown command {opcode:#06x} (OGF {:#04x} OCF {:#05x}) \

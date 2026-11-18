@@ -254,6 +254,15 @@ impl AppleDevices {
             .unwrap_or_default()
     }
 
+    /// The Bluetooth function's trace for the owner's log since it was
+    /// last taken: configurations, resets and the first commands after each
+    /// configuration.
+    pub fn bluetooth_trace(&mut self) -> Vec<UsbBluetoothTrace> {
+        self.usb_bluetooth()
+            .map(|hci| hci.take_trace())
+            .unwrap_or_default()
+    }
+
     /// Whether the guest configured its Bluetooth controller, and the
     /// controller's counters; `None` without one.
     pub fn bluetooth_status(&mut self) -> Option<(bool, UsbBluetoothCounters)> {
