@@ -1,22 +1,39 @@
-//! A Bluetooth controller with no radio, behind the USB HCI function when the
-//! host lends no controller of its own.
+//! A Bluetooth controller with no radio: the controller of the USB HCI
+//! function when it carries the identity of Apple's internal Broadcom USB
+//! Bluetooth module (`super::Hci::modeled`).
 //!
 //! Evidence: Bluetooth Core v5.4 Vol 4 Part E (HCI commands and events), Vol
 //! 1 Part F (error codes) and Vol 2 Part C 3.3 (LMP feature bits). The
-//! controller claims Core 5.0 for BR/EDR and LE and implements every command
-//! its Supported Commands bitmap lists; it lists nothing else. Its radio finds
-//! nothing in range, which is what the state machine says: an Inquiry ends
-//! with no results after its length, a page or remote name request ends with
-//! Page Timeout after the page timeout, an LE scan reports nothing, an LE
-//! connection never completes until cancelled, and high duty cycle directed
-//! advertising ends with Advertising Timeout. Every other opcode, vendor ones
-//! among them, is answered Unknown HCI Command and recorded once for the
-//! owner to report: that is the documented degraded response of a controller
-//! without a radio, never a pretence of one.
+//! controller implements every command its Supported Commands bitmap lists;
+//! it lists nothing else. Its radio finds nothing in range, which is what the
+//! state machine says: an Inquiry ends with no results after its length, a
+//! page or remote name request ends with Page Timeout after the page
+//! timeout, an LE scan reports nothing, an LE connection never completes
+//! until cancelled, and high duty cycle directed advertising ends with
+//! Advertising Timeout. Every other opcode, vendor ones among them, is
+//! answered Command Complete with Unknown HCI Command and recorded once for
+//! the owner to report: that is the documented degraded response of a
+//! controller without a radio, never a pretence of one.
 //!
-//! macOS bluetoothd (26A J473) sends a command
-//! only when its Supported Commands bit is set (command table 0x100b9def8,
-//! gate 0x10019618c), so the bitmap below decides what it asks.
+//! The module is a BCM20702 (BlueTool 26B123 names its firmware
+//! `20702_828F.dfu`), so the controller reports that part as Broadcom
+//! reports it: Read Local Version names company 15 (Broadcom) and the
+//! BCM20702B0's LMP subversion 0x410e (Linux `drivers/bluetooth/btbcm.c`
+//! `bcm_usb_subver_table`), and the Broadcom vendor commands that identify
+//! the part answer with it: Read Verbose Config Version Info (0xFC79) gives
+//! chip id 73, which bluetoothd 26B123 maps to its BCM_20702B0 chipset
+//! (0x1001955dc..0x10019571c), Read USB Product (0xFC5A) the module's USB
+//! IDs, and Read Controller Features (0xFC6E) no proprietary feature. Write
+//! BD_ADDR (0xFC01) sets the address, which survives an HCI Reset (bluetoothd
+//! writes it before its Reset, init table 0x100b38f78 and 0x100b38f90) and
+//! not a USB bus reset. The firmware build is 0: the model runs no Broadcom
+//! firmware.
+//!
+//! macOS bluetoothd (26B123) sends a standard command only when its
+//! Supported Commands bit is set (command table 0x100ba6168, 24-byte entries
+//! with the opcode at +2 and octet and bit mask at +4, read through
+//! 0x1001f1068 and gated at 0x100196974..0x1001969d4), so the bitmap below
+//! decides what it asks. Vendor commands have no bit and are always sent.
 //!
 //! The controller never has a connection, so ACL data from the host names no
 //! connection: it is discarded, counted, and its buffer returned with
@@ -53,12 +70,21 @@ const INQUIRY_UNIT: u64 = 2048 * SLOT;
 /// High duty cycle directed advertising lasts 1.28 s (Vol 6 Part B 4.4.2.4.3).
 const DIRECTED_ADVERTISING: u64 = 2048 * SLOT;
 
-/// Read Local Version Information: Core 5.0 for HCI and LMP. Company
-/// identifier 0xFFFF names no company (Assigned Numbers 7.1): the model is
-/// no vendor's firmware.
-pub const HCI_VERSION: u8 = 0x09;
-pub const LMP_VERSION: u8 = 0x09;
-pub const COMPANY: u16 = 0xffff;
+/// Read Local Version Information: Core 4.0 (version 6) for HCI and LMP, the
+/// version of the BCM20702 family; company 15, Broadcom (Assigned Numbers
+/// 7.1); the BCM20702B0's LMP subversion; HCI revision 0, whose low 12 bits
+/// Broadcom parts report as the firmware build (Linux `btbcm.c`
+/// `btbcm_initialize`).
+pub const HCI_VERSION: u8 = 0x06;
+pub const LMP_VERSION: u8 = 0x06;
+pub const COMPANY: u16 = 15;
+pub const LMP_SUBVERSION: u16 = 0x410e;
+pub const HCI_REVISION: u16 = 0;
+/// Read Verbose Config Version Info's chip id: bluetoothd's BCM_20702B0.
+pub const CHIP_ID: u8 = 73;
+/// The module's USB vendor and product.
+pub const USB_VENDOR: u16 = 0x05ac;
+pub const USB_PRODUCT: u16 = 0x828f;
 /// ACL buffers: the HCI maximum payload, and how many.
 pub const ACL_LENGTH: u16 = 1021;
 pub const ACL_BUFFERS: u16 = 8;
@@ -95,11 +121,11 @@ enum Returns {
 }
 
 /// One implemented command: its Supported Commands octet and bit (Vol 4
-/// Part E 6.27), its parameter length (`None`: variable) and what it returns.
+/// Part E 6.27; `None` for a vendor command, which has none), its parameter
+/// length (`None`: variable) and what it returns.
 struct Command {
     opcode: u16,
-    octet: u8,
-    bit: u8,
+    support: Option<(u8, u8)>,
     parameters: Option<usize>,
     returns: Returns,
 }
@@ -107,10 +133,19 @@ struct Command {
 const fn command(opcode: u16, octet: u8, bit: u8, parameters: usize, returns: Returns) -> Command {
     Command {
         opcode,
-        octet,
-        bit,
+        support: Some((octet, bit)),
         parameters: Some(parameters),
         returns,
+    }
+}
+
+/// A Broadcom vendor command (OGF 0x3F).
+const fn vendor(opcode: u16, parameters: usize, returns: usize) -> Command {
+    Command {
+        opcode,
+        support: None,
+        parameters: Some(parameters),
+        returns: Returns::Complete(returns),
     }
 }
 
@@ -155,8 +190,7 @@ const COMMANDS: &[Command] = &[
     command(0x0c33, 10, 6, 7, Complete(0)),  // Host Buffer Size
     Command {
         opcode: 0x0c35, // Host Number Of Completed Packets
-        octet: 10,
-        bit: 7,
+        support: Some((10, 7)),
         parameters: None,
         returns: Returns::Silent,
     },
@@ -202,6 +236,11 @@ const COMMANDS: &[Command] = &[
     command(0x2011, 27, 0, 7, Complete(0)), // LE Add Device To Filter Accept List
     command(0x2012, 27, 1, 7, Complete(0)), // LE Remove Device From Filter Accept List
     command(0x201c, 28, 3, 0, Complete(8)), // LE Read Supported States
+    // Broadcom vendor commands (Linux `drivers/bluetooth/btbcm.c`).
+    vendor(0xfc01, 6, 0), // Write BD_ADDR (`btbcm_set_bdaddr`)
+    vendor(0xfc5a, 0, 4), // Read USB Product (`btbcm_read_usb_product`)
+    vendor(0xfc6e, 0, 8), // Read Controller Features (`btbcm_read_controller_features`)
+    vendor(0xfc79, 0, 6), // Read Verbose Config Version Info (`btbcm_read_verbose_config`)
 ];
 
 /// Whether the model implements `opcode`.
@@ -209,11 +248,11 @@ pub fn implements(opcode: u16) -> bool {
     COMMANDS.iter().any(|c| c.opcode == opcode)
 }
 
-/// The Supported Commands bitmap: exactly [`COMMANDS`].
+/// The Supported Commands bitmap: exactly the standard [`COMMANDS`].
 pub fn supported_commands() -> [u8; 64] {
     let mut bitmap = [0; 64];
-    for command in COMMANDS {
-        bitmap[usize::from(command.octet)] |= 1 << command.bit;
+    for (octet, bit) in COMMANDS.iter().filter_map(|c| c.support) {
+        bitmap[usize::from(octet)] |= 1 << bit;
     }
     bitmap
 }
@@ -384,6 +423,8 @@ pub struct Air {
 /// The controller.
 #[derive(Debug, Clone)]
 pub struct Model {
+    /// The address at power-on, and the one Write BD_ADDR set since.
+    default_address: [u8; 6],
     address: [u8; 6],
     settings: Box<Settings>,
     /// Every unknown opcode seen, and those the owner has not taken.
@@ -403,6 +444,7 @@ enum Answer {
 impl Model {
     pub fn new(address: [u8; 6]) -> Self {
         Self {
+            default_address: address,
             address,
             settings: Box::new(Settings::new()),
             unknown: Vec::new(),
@@ -430,9 +472,17 @@ impl Model {
         }
     }
 
-    /// Power-on state; pending procedures end without events.
+    /// HCI Reset: the controller's settings return to their power-on values
+    /// and pending procedures end without events. A written BD_ADDR stays.
     pub fn reset(&mut self) {
         *self.settings = Settings::new();
+    }
+
+    /// Power-on, as a USB bus reset gives: [`Self::reset`] and the power-on
+    /// address.
+    pub fn power_on(&mut self) {
+        self.reset();
+        self.address = self.default_address;
     }
 
     /// Unknown opcodes not yet taken, each once per power of the board.
@@ -775,9 +825,11 @@ impl Model {
             // The second octet is unused since Core 4.1.
             0x0c6d => byte(1, &mut s.le_host),
             0x1001 => {
-                let mut r = vec![HCI_VERSION, 0, 0, LMP_VERSION];
+                let mut r = vec![HCI_VERSION];
+                r.extend_from_slice(&HCI_REVISION.to_le_bytes());
+                r.push(LMP_VERSION);
                 r.extend_from_slice(&COMPANY.to_le_bytes());
-                r.extend_from_slice(&[0, 0]);
+                r.extend_from_slice(&LMP_SUBVERSION.to_le_bytes());
                 ok(&r)
             }
             0x1002 => ok(&supported_commands()),
@@ -996,6 +1048,22 @@ impl Model {
                 ok(&[])
             }
             0x201c => ok(&LE_STATES.to_le_bytes()),
+            // Write BD_ADDR: the address in HCI order, as Read BD_ADDR
+            // returns it.
+            0xfc01 => {
+                self.address = bd_addr(p, 0);
+                ok(&[])
+            }
+            0xfc5a => {
+                let mut r = USB_VENDOR.to_le_bytes().to_vec();
+                r.extend_from_slice(&USB_PRODUCT.to_le_bytes());
+                ok(&r)
+            }
+            0xfc6e => ok(&[0; 8]),
+            // Chip id, target id, build base and build number. bluetoothd's
+            // parser (0x1001b6a6c) reads exactly these six bytes and Linux
+            // requires seven with the status.
+            0xfc79 => ok(&[CHIP_ID, 0, 0, 0, 0, 0]),
             _ => unreachable!("every listed command has a case"),
         }
     }

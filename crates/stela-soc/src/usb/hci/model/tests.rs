@@ -45,17 +45,33 @@ fn supported(opcode: u16) -> bool {
     COMMANDS
         .iter()
         .find(|c| c.opcode == opcode)
-        .is_some_and(|c| bitmap[usize::from(c.octet)] & 1 << c.bit != 0)
+        .and_then(|c| c.support)
+        .is_some_and(|(octet, bit)| bitmap[usize::from(octet)] & 1 << bit != 0)
 }
 
+/// bluetoothd's HCI bring-up on the USB transport, replayed step by step
+/// from its step table (26B123: 0x100b38f70, entries 15 to 43) with the
+/// parameters it sends. Each standard command is gated on its Supported
+/// Commands bit; the Broadcom ones on the chipset the USB transport sets.
 #[test]
 fn bluetoothd_bring_up_completes_in_order() {
     let mut model = Model::new(ADDRESS);
-    // The init steps of bluetoothd's HCI bring-up (0x100193274..0x10019191c),
-    // each gated on its Supported Commands bit.
+    // [15] Write BD_ADDR, sent only when the platform stored an address.
+    ok(&mut model, 0xfc01, &[6, 5, 4, 3, 2, 0x42]);
+    assert_eq!(ok(&mut model, 0x1009, &[]), [6, 5, 4, 3, 2, 0x42]);
+    // [18] Reset keeps an address written by the vendor command.
     ok(&mut model, 0x0c03, &[]);
+    assert_eq!(ok(&mut model, 0x1009, &[]), [6, 5, 4, 3, 2, 0x42]);
+    model.power_on();
+    // [19] Read Verbose Config Version Info: chip id, target, build base,
+    // build number (0x1001b6a6c reads six bytes; Linux btbcm.c:333-351
+    // expects seven with the status).
+    let verbose = ok(&mut model, 0xfc79, &[]);
+    assert_eq!(verbose, [CHIP_ID, 0, 0, 0, 0, 0]);
+    // [20] Read Local Version Information.
     let version = ok(&mut model, 0x1001, &[]);
-    assert_eq!(version, [HCI_VERSION, 0, 0, LMP_VERSION, 0xff, 0xff, 0, 0]);
+    assert_eq!(version, [HCI_VERSION, 0, 0, LMP_VERSION, 15, 0, 0x0e, 0x41]);
+    // [21] Supported Commands, [22] BD_ADDR, [23] Features, [24] page 1.
     let commands = ok(&mut model, 0x1002, &[]);
     assert_eq!(commands, supported_commands());
     assert_eq!(ok(&mut model, 0x1009, &[]), ADDRESS);
@@ -66,26 +82,39 @@ fn bluetoothd_bring_up_completes_in_order() {
     let page = ok(&mut model, 0x1004, &[1]);
     assert_eq!(page[..2], [1, MAX_FEATURE_PAGE]);
     assert_eq!(page[2], 0, "the host enabled nothing yet");
+    // [25] LE features.
     assert_eq!(ok(&mut model, 0x2003, &[]), [0; 8]);
+    // [26] Set Event Mask; [27] page 2 is sent only from LMP version 12.
     ok(
         &mut model,
         0x0c01,
         &[0xff, 0xff, 0xfb, 0xff, 0x07, 0xf8, 0xbf, 0x3d],
     );
-    ok(&mut model, 0x0c63, &[0; 8]);
+    const { assert!(LMP_VERSION < 12) };
+    // [28] LE Set Event Mask, [29] SSP, [30] LE Host Supported.
     ok(&mut model, 0x2001, &[0x1f, 0, 0, 0, 0, 0, 0, 0]);
     ok(&mut model, 0x0c56, &[1]);
     ok(&mut model, 0x0c6d, &[1, 0]);
     assert_eq!(ok(&mut model, 0x1004, &[1])[2], 0b11, "SSP and LE host");
+    // [31] LE buffer size (v1), [33] LE states, [34] accept list size.
     assert_eq!(ok(&mut model, 0x2002, &[]), [251, 0, LE_ACL_BUFFERS]);
     assert_eq!(ok(&mut model, 0x201c, &[]), LE_STATES.to_le_bytes());
     assert_eq!(ok(&mut model, 0x200f, &[]), [ACCEPT_LIST_SIZE as u8]);
+    // [35] Read Buffer Size, [39] Host Buffer Size, [40] Flow Control.
     assert_eq!(ok(&mut model, 0x1005, &[]), [0xfd, 0x03, 0, 8, 0, 0, 0]);
     ok(&mut model, 0x0c33, &[0xfd, 0x03, 0, 8, 0, 0, 0]);
     ok(&mut model, 0x0c31, &[1]);
+    // [41] Write Default Erroneous Data Reporting (Broadcom chipsets).
     ok(&mut model, 0x0c5b, &[0]);
+    // Steps bluetoothd takes only when their bits are set: none is.
+    // [25] v2 features 0x2087, [31] v2 buffer 0x2060, [32] 0x202f,
+    // [36][37][43] 0x2074, [38] 0x207d, [42] 0x20a2.
+    for optional in [0x2060, 0x2074, 0x202f, 0x207d, 0x2087, 0x20a2] {
+        assert!(!supported(optional), "{optional:#06x}");
+        assert!(!implements(optional));
+    }
+    // Device configuration after bring-up.
     assert_eq!(ok(&mut model, 0x2007, &[]), [0]);
-    // Device configuration at the login window.
     ok(&mut model, 0x0c24, &[0x0c, 0x01, 0x1c]);
     assert_eq!(ok(&mut model, 0x0c23, &[]), [0x0c, 0x01, 0x1c]);
     let mut name = [0; 248];
@@ -97,19 +126,45 @@ fn bluetoothd_bring_up_completes_in_order() {
     ok(&mut model, 0x0c45, &[2]);
     ok(&mut model, 0x0c52, &[0; 241]);
     assert_eq!(model.air().scan_enable, 3);
-    // Steps bluetoothd takes only when their bits are set: none is.
-    for optional in [0x2060, 0x2074, 0x202f, 0x207d, 0x2087, 0x20a2] {
-        assert!(!supported(optional), "{optional:#06x}");
-        assert!(!implements(optional));
+    // Vendor commands of the stack's later start that the module does not
+    // model answer Unknown HCI Command, each reported once.
+    for opcode in [0xfc27, 0xfd03, 0xfc3b, 0xfe83, 0xfd23, 0xfcf7, 0xfd5c] {
+        let (status, returns) = complete(&run(&mut model, opcode, &[0; 4]), opcode);
+        assert_eq!((status, returns.len()), (UNKNOWN_COMMAND, 0));
     }
+    assert_eq!(model.take_unknown().len(), 7);
+}
+
+/// The Broadcom commands Linux sends an Apple module (btbcm.c
+/// `btbcm_setup_apple`, `btbcm_set_bdaddr`) with the lengths it checks.
+#[test]
+fn the_broadcom_commands_answer_with_their_lengths() {
+    let mut model = Model::new(ADDRESS);
+    // btbcm.c:373-391 expects five bytes: status, vendor, product.
+    let product = ok(&mut model, 0xfc5a, &[]);
+    assert_eq!(product, [0xac, 0x05, 0x8f, 0x82]);
+    // btbcm.c:353-371 expects nine bytes: status and eight feature bytes.
+    assert_eq!(ok(&mut model, 0xfc6e, &[]), [0; 8]);
+    assert_eq!(ok(&mut model, 0xfc79, &[]).len(), 6);
+    // A wrong length is invalid, not unknown, and leaves the address alone.
+    let (status, _) = complete(&run(&mut model, 0xfc01, &[1, 2, 3]), 0xfc01);
+    assert_eq!(status, INVALID_PARAMETERS);
+    assert_eq!(ok(&mut model, 0x1009, &[]), ADDRESS);
+    // Vendor commands are not standard commands: no Supported Commands bit.
+    for opcode in [0xfc01, 0xfc5a, 0xfc6e, 0xfc79] {
+        assert!(implements(opcode));
+        assert!(!supported(opcode));
+    }
+    assert!(model.take_unknown().is_empty());
 }
 
 #[test]
 fn the_bitmap_lists_every_implemented_command_and_nothing_else() {
     let bitmap = supported_commands();
     let set: u32 = bitmap.iter().map(|b| b.count_ones()).sum();
-    assert_eq!(set as usize, COMMANDS.len());
-    for command in COMMANDS {
+    let standard = COMMANDS.iter().filter(|c| c.support.is_some()).count();
+    assert_eq!(set as usize, standard);
+    for command in COMMANDS.iter().filter(|c| c.support.is_some()) {
         assert!(supported(command.opcode));
     }
     // Reset is octet 5 bit 7 (Vol 4 Part E 6.27).

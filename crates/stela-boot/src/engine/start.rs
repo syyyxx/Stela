@@ -1775,7 +1775,9 @@ fn place_devices(
             usb: stela_soc::machine::UsbCables {
                 disks: placement.usb_disks,
                 network: placement.guest_mac,
-                bluetooth: placement.guest_bluetooth,
+                bluetooth: placement
+                    .guest_bluetooth
+                    .then_some(stela_soc::machine::UsbBluetooth::Host),
             },
             scanout,
             firmware: &firmware,

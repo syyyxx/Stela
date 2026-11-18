@@ -1,21 +1,47 @@
 //! A native USB Bluetooth controller: the HCI USB transport, whose packets
-//! the machine owner exchanges with a controller of the host.
+//! the machine owner exchanges with a controller of the host, or which the
+//! controller model ([`model::Model`]) answers.
 //!
-//! Evidence: Bluetooth Core v5.4 Vol 4 Part B 2 (class 0xE0/0x01/0x01, HCI
-//! commands as class request 0 on the control pipe, events on interrupt IN,
-//! ACL data on bulk IN and OUT) and Part E 5.4 (packet lengths) and 7.7.14
-//! (Command Complete). J473 macOS binds no kernel driver: `bluetoothd`'s
-//! `Found_USB_Dongle` (0x1000fc61c) opens the `IOUSBHostDevice` from user
-//! space, takes vendor 0x0A12, 0x0A5C or a short list of pairs, ignores any
-//! other, and `FoundBluetoothInterfaces` (0x1000ffde0) walks the interfaces
-//! for the endpoints above.
+//! Evidence: Bluetooth Core v5.4 Vol 4 Part B 2 (HCI commands as class
+//! request 0 on the control pipe, events on interrupt IN, ACL data on bulk
+//! IN and OUT) and Part E 5.4 (packet lengths) and 7.7.14 (Command
+//! Complete). J473 macOS binds no kernel driver: bluetoothd's USB transport
+//! (bm3_usb, 26B123) opens the `IOUSBHostDevice` from user space, takes a
+//! device of class 0xE0, 0xEF or 0xFF (0x100100f38), finds its interfaces
+//! with subclass 1 and protocol 1 of any class (the find request built at
+//! 0x1000fef04), and requires interface 0 with an interrupt IN, a bulk IN
+//! and a bulk OUT pipe (0x1000ff16c..0x1000ff224).
 //!
-//! The function therefore carries CSR's generic HCI identity, 0x0A12:0x0001,
-//! whatever the host's controller is: that identity promises the standard
-//! HCI and no vendor protocol. A vendor command (OGF 0x3F) means something
-//! else to every other vendor's controller, so none reaches the host's: the
-//! function answers each with Command Complete, status Unknown HCI Command,
-//! and counts it.
+//! The function has one of two identities, chosen before the guest sees it:
+//!
+//! - [`Hci::new`], for a host controller lent to the guest: CSR's generic
+//!   HCI identity, 0x0A12:0x0001, class 0xE0/0x01/0x01, whatever the host's
+//!   controller is. That identity promises the standard HCI and no vendor
+//!   protocol. A vendor command (OGF 0x3F) means something else to every
+//!   other vendor's controller, so none reaches the host's: the function
+//!   answers each with Command Complete, status Unknown HCI Command, and
+//!   counts it.
+//! - [`Hci::modeled`], for the controller model: Apple's internal Broadcom
+//!   USB Bluetooth module, vendor 0x05AC, product 0x828F, bcdDevice 0x0150,
+//!   product string "Bluetooth USB Host Controller". macOS on the USB
+//!   transport accepts only that module: BlueTool's boot step (26B123
+//!   `updateFirmwareInSerialFlash`, 0x10000e3a0..0x10000e434) waits for an
+//!   IOService named exactly "Bluetooth USB Host Controller", a USB
+//!   device's registry name being its product string, and for product
+//!   0x828F with firmware v150 (bcdDevice 0x0150 read as BCD,
+//!   0x10000e564..0x10000e58c) says "Firmware update not needed" and
+//!   returns 0 (0x10000eed8..0x10000ef54); any other pair starts a DFU
+//!   download. bluetoothd takes the same name as the internal controller
+//!   (0x100100ffc..0x10010107c). Linux matches Apple's Broadcom modules by
+//!   vendor 0x05AC and interface class 0xFF/0x01/0x01
+//!   (`drivers/bluetooth/btusb.c` `btusb_table`, "Apple-specific (Broadcom)
+//!   devices"), ahead of its generic class 0xE0 entries, so the module is
+//!   not of class 0xE0/0x01/0x01: its device and interfaces are
+//!   0xFF/0x01/0x01, which bluetoothd also takes. The manufacturer string
+//!   names the vendor the ID belongs to. Linux also names a diagnostic
+//!   interface at number 2 for these modules (`data->diag`); bluetoothd
+//!   uses only interfaces 0 and 1 of this product (0x1000fef70) and Linux
+//!   runs without it, so the function has none.
 //!
 //! The configuration also carries the standard synchronous interface (Vol 4
 //! Part B 2.1.1): interface 1, alternate settings 0-5, each with an
@@ -25,10 +51,6 @@
 //! pipes in each of alternate settings 0-5. Isochronous data is not
 //! transported: the endpoints answer no transaction, so a SCO link carries
 //! no audio. The model never forms one.
-//!
-//! When the host lends no controller, the owner selects [`model::Model`]
-//! with [`Hci::use_model`]: the same function then answers every command
-//! itself, as a controller whose radio finds nothing in range.
 //!
 //! HCI headers frame every packet, so an OUT transfer may span USB packets.
 //! An IN packet that ends one on a full USB packet is followed by a
@@ -167,22 +189,58 @@ pub struct Hci {
     state: State,
 }
 
-fn descriptors() -> Descriptors {
+/// What the function says it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Identity {
+    /// Class, subclass and protocol of the device and its interfaces.
+    class: [u8; 3],
+    vendor: u16,
+    product: u16,
+    release: u16,
+    manufacturer: &'static str,
+    name: &'static str,
+}
+
+/// CSR's generic HCI identity, for a host controller.
+const GENERIC: Identity = Identity {
+    class: [0xe0, 0x01, 0x01],
+    vendor: 0x0a12,
+    product: 0x0001,
+    release: 0x0100,
+    manufacturer: "Stela",
+    name: "Stela Bluetooth",
+};
+
+/// Apple's internal Broadcom USB Bluetooth module, for the model.
+const APPLE_MODULE: Identity = Identity {
+    class: [0xff, 0x01, 0x01],
+    vendor: model::USB_VENDOR,
+    product: model::USB_PRODUCT,
+    release: 0x0150,
+    manufacturer: "Apple Inc.",
+    name: "Bluetooth USB Host Controller",
+};
+
+fn descriptors(identity: &Identity) -> Descriptors {
+    let [class, subclass, protocol] = identity.class;
+    let [vendor_low, vendor_high] = identity.vendor.to_le_bytes();
+    let [product_low, product_high] = identity.product.to_le_bytes();
+    let [release_low, release_high] = identity.release.to_le_bytes();
     let device = [
         18,
         DEVICE,
         0x00,
         0x02,
-        0xe0,
-        0x01,
-        0x01,
+        class,
+        subclass,
+        protocol,
         control::EP0_PACKET as u8,
-        0x12,
-        0x0a,
-        0x01,
-        0x00,
-        0x00,
-        0x01,
+        vendor_low,
+        vendor_high,
+        product_low,
+        product_high,
+        release_low,
+        release_high,
         1,
         2,
         0,
@@ -191,13 +249,23 @@ fn descriptors() -> Descriptors {
     let configuration = |bulk: u16, interval: u8| {
         let [low, high] = bulk.to_le_bytes();
         let mut parts = vec![
-            vec![9, INTERFACE, 0, 0, 3, 0xe0, 0x01, 0x01, 0],
+            vec![9, INTERFACE, 0, 0, 3, class, subclass, protocol, 0],
             vec![7, ENDPOINT, EVENTS, 3, EVENT_PACKET as u8, 0, interval],
             vec![7, ENDPOINT, ACL_IN, 2, low, high, 0],
             vec![7, ENDPOINT, ACL_OUT, 2, low, high, 0],
         ];
         for (setting, &size) in SCO_PACKETS.iter().enumerate() {
-            parts.push(vec![9, INTERFACE, 1, setting as u8, 2, 0xe0, 0x01, 0x01, 0]);
+            parts.push(vec![
+                9,
+                INTERFACE,
+                1,
+                setting as u8,
+                2,
+                class,
+                subclass,
+                protocol,
+                0,
+            ]);
             for address in [SCO_IN, SCO_OUT] {
                 // Isochronous, no synchronization, one packet a frame.
                 parts.push(vec![7, ENDPOINT, address, 0x01, size, 0, interval]);
@@ -211,9 +279,9 @@ fn descriptors() -> Descriptors {
         DEVICE_QUALIFIER,
         0x00,
         0x02,
-        0xe0,
-        0x01,
-        0x01,
+        class,
+        subclass,
+        protocol,
         control::EP0_PACKET as u8,
         1,
         0,
@@ -223,14 +291,28 @@ fn descriptors() -> Descriptors {
         // High speed: 2^(4-1) microframes, 1 ms; full speed: 1 frame.
         configuration: configuration(HIGH_SPEED_PACKET, 4),
         other_speed: Some((qualifier, configuration(FULL_SPEED_PACKET, 1))),
-        strings: vec![String::from("Stela"), String::from("Stela Bluetooth")],
+        strings: vec![
+            String::from(identity.manufacturer),
+            String::from(identity.name),
+        ],
     }
 }
 
 impl Hci {
+    /// The function for a host controller: its packets go to the owner.
     pub fn new() -> Self {
+        Self::with(&GENERIC, None)
+    }
+
+    /// Apple's internal USB Bluetooth module, answered by the controller
+    /// model, whose power-on BD_ADDR is `address`.
+    pub fn modeled(address: [u8; 6]) -> Self {
+        Self::with(&APPLE_MODULE, Some(Box::new(model::Model::new(address))))
+    }
+
+    fn with(identity: &Identity, model: Option<Box<model::Model>>) -> Self {
         Self {
-            control: Control::new(descriptors()),
+            control: Control::new(descriptors(identity)),
             state: State {
                 halted: [false; 3],
                 sco_setting: 0,
@@ -239,7 +321,7 @@ impl Hci {
                 acl: Stream::default(),
                 assembling: Vec::new(),
                 counters: Counters::default(),
-                model: None,
+                model,
                 now: 0,
             },
         }
@@ -261,23 +343,9 @@ impl Hci {
         state.events.queue.len() < QUEUE_PACKETS && state.acl.queue.len() < QUEUE_PACKETS
     }
 
-    /// Answers every packet with a controller model whose BD_ADDR is
-    /// `address`, from now on. Packets already queued for a host
-    /// controller go to it.
-    pub fn use_model(&mut self, address: [u8; 6]) {
-        let state = &mut self.state;
-        state.model = Some(Box::new(model::Model::new(address)));
-        for packet in core::mem::take(&mut state.outbound) {
-            match packet {
-                Outbound::Command(bytes) => state.modeled_command(&bytes),
-                Outbound::Acl(bytes) => state.modeled_acl(&bytes),
-            }
-        }
-    }
-
-    /// Whether the model answers.
-    pub fn modeled(&self) -> bool {
-        self.state.model.is_some()
+    /// The model's BD_ADDR now; `None` for a host controller's function.
+    pub fn model_address(&self) -> Option<[u8; 6]> {
+        self.state.model.as_ref().map(|model| model.address())
     }
 
     /// Opcodes the model answered Unknown HCI Command that were not taken
@@ -375,9 +443,11 @@ impl State {
             self.counters.malformed += 1;
             return Err(Stall);
         }
-        let vendor = u16::from_le_bytes([low, high]) >> 10 == VENDOR_GROUP;
+        let opcode = u16::from_le_bytes([low, high]);
+        let vendor = opcode >> 10 == VENDOR_GROUP;
         if self.model.is_some() {
-            self.counters.vendor_refused += u64::from(vendor);
+            // The module answers the Broadcom commands it models.
+            self.counters.vendor_refused += u64::from(vendor && !model::implements(opcode));
             self.modeled_command(packet);
             return Ok(());
         }
@@ -487,7 +557,7 @@ impl BusPeer for Hci {
     fn reset(&mut self) -> Result<()> {
         // A bus reset powers the controller up again.
         if let Some(model) = self.state.model.as_mut() {
-            model.reset();
+            model.power_on();
         }
         self.control.reset(&mut self.state)?;
         self.state
@@ -552,11 +622,36 @@ mod tests {
         tests::{setup, transfer},
     };
 
-    fn controller() -> Hci {
-        let mut hci = Hci::new();
+    fn configured(mut hci: Hci) -> Hci {
         transfer(&mut hci, setup(0, SET_ADDRESS, 1, 0, 0), &[]).unwrap();
         transfer(&mut hci, setup(0, SET_CONFIGURATION, 1, 0, 0), &[]).unwrap();
         hci
+    }
+
+    fn controller() -> Hci {
+        configured(Hci::new())
+    }
+
+    const ADDRESS: [u8; 6] = [1, 2, 3, 4, 5, 0x02];
+
+    fn modeled() -> Hci {
+        configured(Hci::modeled(ADDRESS))
+    }
+
+    /// A string descriptor's text (UTF-16LE after its two-byte header).
+    fn string(hci: &mut Hci, index: u8) -> String {
+        let bytes = transfer(
+            hci,
+            setup(0x80, 6, 0x0300 | u16::from(index), 0x0409, 255),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(usize::from(bytes[0]), bytes.len());
+        let units: Vec<u16> = bytes[2..]
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16(&units).unwrap()
     }
 
     fn command(hci: &mut Hci, packet: &[u8]) -> Result<(), ()> {
@@ -581,13 +676,50 @@ mod tests {
 
     #[test]
     fn the_identity_is_a_generic_bluetooth_controller_macos_accepts() {
-        let hci = Hci::new();
+        let mut hci = Hci::new();
         let device = hci.control.descriptors.device;
         assert_eq!(device[4..7], [0xe0, 0x01, 0x01]);
         assert_eq!(device[8..12], [0x12, 0x0a, 0x01, 0x00]);
-        let configuration = hci.control.descriptors.configuration;
+        let configuration = hci.control.descriptors.configuration.clone();
         assert_eq!(configuration[9 + 4], 3, "interrupt, bulk IN and bulk OUT");
         assert_eq!(configuration[9 + 5..9 + 8], [0xe0, 0x01, 0x01]);
+        assert_eq!(hci.model_address(), None);
+        transfer(&mut hci, setup(0, SET_ADDRESS, 1, 0, 0), &[]).unwrap();
+        assert_eq!(string(&mut hci, 2), "Stela Bluetooth");
+    }
+
+    /// The identity BlueTool and bluetoothd take on the USB transport:
+    /// the name they match, the product and firmware version BlueTool needs
+    /// no update for, and the class triple Linux matches Apple's modules by.
+    #[test]
+    fn the_modeled_function_is_apples_internal_usb_module() {
+        let mut hci = Hci::modeled(ADDRESS);
+        let device = hci.control.descriptors.device;
+        assert_eq!(device[..4], [18, DEVICE, 0x00, 0x02], "USB 2.0");
+        assert_eq!(device[4..7], [0xff, 0x01, 0x01]);
+        // idVendor 0x05AC, idProduct 0x828F, bcdDevice 0x0150 (v150).
+        assert_eq!(device[8..14], [0xac, 0x05, 0x8f, 0x82, 0x50, 0x01]);
+        assert_eq!(device[14..18], [1, 2, 0, 1], "strings, one configuration");
+        let (qualifier, _) = hci.control.descriptors.other_speed.clone().unwrap();
+        assert_eq!(qualifier[4..7], [0xff, 0x01, 0x01]);
+        for configuration in [
+            hci.control.descriptors.configuration.clone(),
+            hci.control.descriptors.other_speed.clone().unwrap().1,
+        ] {
+            let mut at = 9;
+            while at < configuration.len() {
+                let d = &configuration[at..at + usize::from(configuration[at])];
+                if d[1] == INTERFACE {
+                    assert_eq!(d[5..8], [0xff, 0x01, 0x01], "interface {}", d[2]);
+                    assert!(d[2] <= 1, "interfaces 0 and 1 only");
+                }
+                at += d.len();
+            }
+        }
+        assert_eq!(hci.model_address(), Some(ADDRESS));
+        transfer(&mut hci, setup(0, SET_ADDRESS, 1, 0, 0), &[]).unwrap();
+        assert_eq!(string(&mut hci, 1), "Apple Inc.");
+        assert_eq!(string(&mut hci, 2), "Bluetooth USB Host Controller");
     }
 
     /// The walk a host stack makes before it takes the controller:
@@ -595,10 +727,13 @@ mod tests {
     /// an isochronous IN and OUT pipe in each of alternate settings 0-5.
     #[test]
     fn the_configuration_has_the_interfaces_bluetoothd_requires() {
-        for configuration in [
-            descriptors().configuration,
-            descriptors().other_speed.unwrap().1,
-        ] {
+        for configuration in [GENERIC, APPLE_MODULE].iter().flat_map(|identity| {
+            let descriptors = descriptors(identity);
+            [
+                descriptors.configuration,
+                descriptors.other_speed.unwrap().1,
+            ]
+        }) {
             assert_eq!(configuration[4], 2, "two interfaces");
             assert_eq!(
                 usize::from(u16::from_le_bytes([configuration[2], configuration[3]])),
@@ -745,11 +880,8 @@ mod tests {
 
     #[test]
     fn the_model_answers_through_the_same_pipes() {
-        let mut hci = controller();
-        // Queued before the owner chose the model: the model takes it.
+        let mut hci = modeled();
         command(&mut hci, &[0x03, 0x0c, 0]).unwrap();
-        hci.use_model([1, 2, 3, 4, 5, 0x02]);
-        assert!(hci.modeled());
         assert_eq!(hci.take(), None, "nothing reaches a host controller");
         assert_eq!(
             read(&mut hci, EVENTS, EVENT_PACKET),
@@ -761,14 +893,27 @@ mod tests {
             read(&mut hci, EVENTS, EVENT_PACKET).concat(),
             [COMMAND_COMPLETE, 10, 1, 0x09, 0x10, 0, 1, 2, 3, 4, 5, 0x02]
         );
-        // A vendor command is unknown to the model, and reported once.
-        command(&mut hci, &[0x01, 0xfc, 1, 9]).unwrap();
-        command(&mut hci, &[0x01, 0xfc, 1, 9]).unwrap();
+        // A vendor command the model does not know answers Unknown HCI
+        // Command each time, and is reported once.
+        command(&mut hci, &[0x4c, 0xfc, 1, 9]).unwrap();
+        command(&mut hci, &[0x4c, 0xfc, 1, 9]).unwrap();
         assert_eq!(read(&mut hci, EVENTS, EVENT_PACKET)[0][5], UNKNOWN_COMMAND);
         assert_eq!(read(&mut hci, EVENTS, EVENT_PACKET)[0][5], UNKNOWN_COMMAND);
-        assert_eq!(hci.take_unknown(), [0xfc01]);
+        assert_eq!(hci.take_unknown(), [0xfc4c]);
         assert_eq!(hci.counters().vendor_refused, 2);
         assert_eq!(hci.counters().unknown, 2);
+        // Write BD_ADDR is the module's own, and a bus reset undoes it.
+        command(&mut hci, &[0x01, 0xfc, 6, 9, 8, 7, 6, 5, 0x42]).unwrap();
+        assert_eq!(
+            read(&mut hci, EVENTS, EVENT_PACKET)[0][3..6],
+            [0x01, 0xfc, 0]
+        );
+        assert_eq!(hci.model_address(), Some([9, 8, 7, 6, 5, 0x42]));
+        assert_eq!(hci.counters().unknown, 2);
+        assert_eq!(hci.counters().vendor_refused, 2);
+        hci.reset().unwrap();
+        assert_eq!(hci.model_address(), Some(ADDRESS));
+        let mut hci = configured(hci);
         // ACL data gets its buffer back.
         hci.packet(ACL_OUT, Token::Out, &mut [1, 0, 1, 0, 7])
             .unwrap();
@@ -781,8 +926,7 @@ mod tests {
 
     #[test]
     fn a_procedure_ends_when_the_system_count_reaches_it() {
-        let mut hci = controller();
-        hci.use_model([1, 2, 3, 4, 5, 0x02]);
+        let mut hci = modeled();
         hci.set_time(100);
         // Inquiry for 1.28 s.
         command(&mut hci, &[0x01, 0x04, 5, 0x33, 0x8b, 0x9e, 1, 0]).unwrap();
