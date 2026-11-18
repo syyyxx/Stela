@@ -164,8 +164,16 @@ fn bluetoothd_bring_up_completes_in_order() {
     // cores, the main core's bit.
     ok(&mut model, 0xfe29, &[0b11, 2, 0, 0, 1, 0, 0, 0, 0]);
     assert_eq!(model.air().scanning, Some((0, 1)));
+    // Its completion (0x100259d84) wipes the duplicate list of the running
+    // cores when the platform filters duplicates in the controller
+    // (0x100259e04; round 4 did not), then reads the low-power core's
+    // statistics once (0x100259fb4, clear 1). The parser (0x1001b554c)
+    // takes ten counters; the scan is started after it (0x100259fc4).
+    ok(&mut model, 0xfe2a, &[1]);
+    assert_eq!(ok(&mut model, 0xfe3b, &[1]), [0; 40]);
     assert!(model.advance(u64::MAX).is_empty(), "nothing in range");
-    // LE_StopScan (0x1002585c8): flags 0 on both cores.
+    // LE_StopScan (0x1002585c8): flags 0 on both cores. Its completion
+    // (0x100258680) restarts a scan with the same parameter commands.
     ok(&mut model, 0xfe29, &[0, 2, 0, 0, 3, 0, 0, 0, 0]);
     assert_eq!(model.air().scanning, None);
     assert!(model.take_unknown().is_empty());
@@ -195,7 +203,15 @@ fn the_multi_core_scan_commands_check_their_lengths_and_cores() {
     );
     assert_eq!(status, INVALID_PARAMETERS);
     assert_eq!(model.air().scanning, None);
-    for opcode in [0xfe29, 0xfe37] {
+    // The statistics read keeps its return length on an error, as the
+    // parser asserts its bounds.
+    let (status, returns) = complete(&run(&mut model, 0xfe3b, &[2]), 0xfe3b);
+    assert_eq!((status, returns.len()), (INVALID_PARAMETERS, 40));
+    let (status, _) = complete(&run(&mut model, 0xfe3b, &[0, 0]), 0xfe3b);
+    assert_eq!(status, INVALID_PARAMETERS);
+    let (status, _) = complete(&run(&mut model, 0xfe2a, &[0x10]), 0xfe2a);
+    assert_eq!(status, INVALID_PARAMETERS);
+    for opcode in [0xfe29, 0xfe2a, 0xfe37, 0xfe3b] {
         assert!(implements(opcode));
         assert!(!supported(opcode));
     }

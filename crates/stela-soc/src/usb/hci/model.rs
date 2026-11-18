@@ -42,9 +42,10 @@
 //! (MobileGestalt; BCM_4388 here), and the chipset Read Verbose Config gives
 //! later (0x10058f1fc) clears them only for a third-party dongle
 //! (0x10058f288). So on this board it scans with Apple's multi-core scan
-//! commands whatever chip the module reports, and the model answers the two
-//! it sends, 0xFE37 and 0xFE29; an Unknown HCI Command there restarted the
-//! daemon ("Scan stopped improperly with result 701 -- restart").
+//! commands whatever chip the module reports, and the model answers every
+//! command of that scan start and stop: 0xFE37, 0xFE29, 0xFE2A and 0xFE3B.
+//! An Unknown HCI Command to any of them fails the scan start, and the
+//! daemon restarts ("Scan stopped improperly with result 701 -- restart").
 //!
 //! The controller never has a connection, so ACL data from the host names no
 //! connection: it is discarded, counted, and its buffer returned with
@@ -283,7 +284,14 @@ const COMMANDS: &[Command] = &[
     // and `_BCM_OlympicLESetScanParametersMultiCore`): see `execute`.
     vendor(0xfe29, Fixed(9), 0),
     vendor(0xfe37, ScanCores, 0),
+    // `_BCM_LEMetaAdvMatchingRuleWipeDuplicateList` and
+    // `_BCM_LEMetaGetLPCoreStatistics`, the scan start's last steps.
+    vendor(0xfe2a, Fixed(1), 0),
+    vendor(0xfe3b, Fixed(1), LP_CORE_STATISTICS),
 ];
+
+/// The short form of the low-power core statistics: ten 32-bit counters.
+const LP_CORE_STATISTICS: usize = 40;
 
 /// Whether the model implements `opcode`.
 pub fn implements(opcode: u16) -> bool {
@@ -1131,6 +1139,29 @@ impl Model {
                 }
                 s.scanning = (p[0] & 1 != 0).then_some(p[0] >> 1 & 1);
                 ok(&[])
+            }
+            // Wipe the advertising matching rules' duplicate list of the
+            // cores named (builder 0x1001d66bc, one byte; sent after the
+            // scan enable when the platform filters duplicates in the
+            // controller, 0x100259e04). The model keeps no duplicate list.
+            // Its completion reads the status alone.
+            0xfe2a => {
+                if p[0] > 0x0f {
+                    return fail(INVALID_PARAMETERS);
+                }
+                ok(&[])
+            }
+            // Read the low-power core's statistics (builder 0x1001d5d18:
+            // one byte, whether to clear them), the last step of a scan
+            // start on a board with a scan core (0x100259fb4). Its parser
+            // (0x1001b554c) reads ten 32-bit counters and, only when more
+            // bytes follow, 43 more fields; any other length fails its
+            // bounds asserts. A core that has not run has counted nothing.
+            0xfe3b => {
+                if p[0] > 1 {
+                    return fail(INVALID_PARAMETERS);
+                }
+                ok(&[0; LP_CORE_STATISTICS])
             }
             _ => unreachable!("every listed command has a case"),
         }
