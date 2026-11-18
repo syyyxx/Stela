@@ -107,6 +107,8 @@ pub const TRACED_COMMANDS: u16 = 48;
 /// daemon that restarts begins each bring-up with one and need not
 /// configure the function again.
 const TRACED_BRING_UPS: u8 = 4;
+/// Parameter bytes a traced command shows.
+pub const TRACED_BYTES: usize = 4;
 /// Trace entries held until the owner takes them; later ones are dropped.
 const TRACE_ENTRIES: usize = 64;
 /// HCI error 0x01 (Vol 1 Part F 1.3).
@@ -116,12 +118,14 @@ const UNKNOWN_COMMAND: u8 = 0x01;
 /// after it configures the function, and its resets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Traced {
-    /// A command the model answered: its opcode and parameter length, and
-    /// the event that answered it, if any, with its status and the length
-    /// of its return parameters after the status.
+    /// A command the model answered: its opcode, parameter length and
+    /// first parameter bytes (a vendor command's sub-command), and the
+    /// event that answered it, if any, with its status and the length of
+    /// its return parameters after the status.
     Command {
         opcode: u16,
         parameters: u8,
+        first: [u8; TRACED_BYTES],
         answer: Option<Answered>,
     },
     /// The guest set the configuration to this value (0: unconfigured).
@@ -148,9 +152,18 @@ impl core::fmt::Display for Traced {
             Self::Command {
                 opcode,
                 parameters,
+                first,
                 answer,
             } => {
                 write!(f, "command {opcode:#06x} parameters={parameters} ")?;
+                let shown = &first[..usize::from(parameters).min(TRACED_BYTES)];
+                if !shown.is_empty() {
+                    f.write_str("[")?;
+                    for (index, byte) in shown.iter().enumerate() {
+                        write!(f, "{}{byte:02x}", if index == 0 { "" } else { " " })?;
+                    }
+                    f.write_str("] ")?;
+                }
                 match answer {
                     Some(Answered {
                         event,
@@ -535,9 +548,16 @@ impl State {
                 }),
                 _ => None,
             });
+            let mut first = [0; TRACED_BYTES];
+            let shown = packet[COMMAND_HEADER..].iter().take(TRACED_BYTES);
+            first
+                .iter_mut()
+                .zip(shown)
+                .for_each(|(to, from)| *to = *from);
             self.trace(Traced::Command {
                 opcode,
                 parameters: packet[2],
+                first,
                 answer,
             });
             if self.tracing == 0 {
@@ -1090,21 +1110,25 @@ mod tests {
                 Traced::Command {
                     opcode: 0x0c03,
                     parameters: 0,
+                    first: [0; 4],
                     answer: complete(0, 0),
                 },
                 Traced::Command {
                     opcode: 0x1004,
                     parameters: 1,
+                    first: [2, 0, 0, 0],
                     answer: complete(0, 10),
                 },
                 Traced::Command {
                     opcode: 0xfc4c,
                     parameters: 1,
+                    first: [9, 0, 0, 0],
                     answer: complete(UNKNOWN_COMMAND, 0),
                 },
                 Traced::Command {
                     opcode: 0x0401,
                     parameters: 5,
+                    first: [0x33, 0x8b, 0x9e, 1],
                     answer: Some(Answered {
                         event: COMMAND_STATUS,
                         status: 0,
@@ -1114,17 +1138,22 @@ mod tests {
                 Traced::Command {
                     opcode: 0x0c35,
                     parameters: 5,
+                    first: [1, 0x40, 0, 1],
                     answer: None,
                 },
             ]
         );
         assert_eq!(
+            traced[0].to_string(),
+            "command 0x0c03 parameters=0 answered complete status=0x00 returns=0"
+        );
+        assert_eq!(
             traced[1].to_string(),
-            "command 0x1004 parameters=1 answered complete status=0x00 returns=10"
+            "command 0x1004 parameters=1 [02] answered complete status=0x00 returns=10"
         );
         assert_eq!(
             traced[4].to_string(),
-            "command 0x0c35 parameters=5 answered with no event"
+            "command 0x0c35 parameters=5 [01 40 00 01] answered with no event"
         );
         // The trace ends after its commands, once.
         let read_address = |hci: &mut Hci, count: u16| {
