@@ -246,12 +246,6 @@ impl AppleDevices {
         self.usb_bluetooth()?.take()
     }
 
-    /// The modeled controller's BD_ADDR now, derived from the board's ECID
-    /// at power-on; `None` without one.
-    pub fn bluetooth_model(&mut self) -> Option<[u8; 6]> {
-        self.usb_bluetooth()?.model_address()
-    }
-
     /// Opcodes the modeled controller answered Unknown HCI Command, each
     /// once.
     pub fn bluetooth_unknown(&mut self) -> Vec<u16> {

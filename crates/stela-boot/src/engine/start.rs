@@ -49,16 +49,14 @@ fn from_disk(
     // (osfmk/kern/startup.h), converted to ticks only when overridden.
     // System sleep is not modeled, so `noidle` stops the idle timer that
     // would ask for it.
-    // The guest's Bluetooth is a host controller bridged over USB, when the
-    // host lends one: bluetoothd and BlueTool then take USB, transport 0
-    // (26A434 bluetoothd's transport switch at x86_64 0x1001f84e7). Without
-    // one there is no chip on any transport, and bluetoothd does what it does
-    // on a Mac whose radio fails to boot: it logs "Bluetooth error -
-    // restarting" (reason 1214, chip boot failure) and restarts its stack
-    // every 40 s or so, whether it looks on its default UART (3) or the
-    // board's PCIe (7). Overriding it to USB then would be worse: its HCI
-    // initialization fails (`OI_HCIAPI_Init_Vars`) and it aborts with
-    // "Bluetooth fatal error" (reason 0x5c), each time with a crash report.
+    // The guest's Bluetooth controller is a USB function on the native hub
+    // (`stela_soc::usb::hci`), so the tree says the board's Bluetooth is on
+    // USB: `/arm-io/bluetooth` `transport-encoding` 0, where J473's says 7
+    // (PCIe). bluetoothd (26B123 0x10016e124) and BlueTool (0x100028f3c)
+    // read that property and take the `bt-transport-override` boot-arg only
+    // as an override of it, which then stays unset. On transport 0 BlueTool
+    // boots the chip by matching the USB module by name and version, and
+    // bluetoothd takes the chipset of Apple's internal module.
     let mut defaults = boot_bundle::Options {
         ecid: options.ecid,
         boot_command: options.boot_command,
@@ -69,7 +67,13 @@ fn from_disk(
         ..boot_bundle::Options::default()
     };
     if bluetooth {
-        defaults.boot_args.push_str(" bt-transport-override=0");
+        defaults
+            .overlay
+            .push(stela_formats::boot_bundle::schema::OverlayProperty {
+                path: "/arm-io/bluetooth".into(),
+                property: "transport-encoding".into(),
+                value: 0u32.to_le_bytes().to_vec(),
+            });
     }
     defaults.boot_args.push_str(&lock_timeout_arguments(tsc_hz));
     // The automatic Metal plugin repair NVRAM asked for is the manual
@@ -1095,7 +1099,7 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
             rtc_anchor: host_nor.as_ref().and_then(nor::HostNor::loaded_anchor),
             usb_disks,
             guest_mac: guest_network.as_ref().map(network::GuestNetwork::mac),
-            guest_bluetooth: host_bluetooth.is_some(),
+            guest_bluetooth: host_bluetooth.as_ref().map(bluetooth::HostBluetooth::kind),
         },
         board.as_ref(),
         &core_locks,
@@ -1637,7 +1641,7 @@ struct Placement<'a> {
     rtc_anchor: Option<stela_soc::machine::RtcAnchor>,
     usb_disks: Vec<alloc::boxed::Box<dyn stela_drivers::block::BlockDevice>>,
     guest_mac: Option<stela_drivers::net::Mac>,
-    guest_bluetooth: bool,
+    guest_bluetooth: Option<stela_soc::machine::UsbBluetooth>,
 }
 
 /// The placed devices, the USB port a restore drives, and whether guest
@@ -1775,9 +1779,7 @@ fn place_devices(
             usb: stela_soc::machine::UsbCables {
                 disks: placement.usb_disks,
                 network: placement.guest_mac,
-                bluetooth: placement
-                    .guest_bluetooth
-                    .then_some(stela_soc::machine::UsbBluetooth::Host),
+                bluetooth: placement.guest_bluetooth,
             },
             scanout,
             firmware: &firmware,
@@ -2984,7 +2986,7 @@ fn start_devices(
     } = wanted;
     let mut fdr_device = None;
     let mut host_usb = None;
-    let host_bluetooth: Option<bluetooth::HostBluetooth> = None;
+    let mut host_bluetooth: Option<bluetooth::HostBluetooth> = None;
     let (services, medium, preboot, host_input, host_network, usb_disks, guest_network, host_disks) =
         if targets.is_empty()
             && options.install_source.is_none()
@@ -3209,18 +3211,18 @@ fn start_devices(
                 crate::status::info(super::firmware_requests::MISSING);
             }
             host_usb = Some(usb);
-            // macOS gets no Bluetooth controller. Its bluetoothd picks the
-            // guest's USB controller and never sends it a command, in every
-            // run with a host controller or the model, and Setup's Language
-            // Chooser then waits for bluetoothd with a black screen. Without
-            // a controller bluetoothd restarts and Setup goes on. The host's
-            // controller is released in the loader's root by its drop. The
-            // log says so once, with a host controller or without one.
-            if let Some(line) = stela_boot_core::guest_bluetooth::unsupported_line(
+            // The guest's controller is the model of Apple's internal USB
+            // module, for every boot with host input. The host's controller
+            // is not lent: the guest's function would carry the host's
+            // vendor commands and replies, which BlueTool's chip boot and
+            // bluetoothd's bring-up do not take. It is released in the
+            // loader's root by its drop. The log says so once.
+            if let Some(line) = stela_boot_core::guest_bluetooth::model_line(
                 host_controller.is_some(),
                 options.input,
             ) {
                 output::arguments(format_args!("{line}"));
+                host_bluetooth = Some(bluetooth::HostBluetooth::modeled(handoff.root));
             }
             drop(host_controller);
             // With no adapter started, the screen names each one found and

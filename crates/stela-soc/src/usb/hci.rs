@@ -112,7 +112,7 @@ pub enum Outbound {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Counters {
     pub commands: u64,
-    /// Vendor commands answered here.
+    /// Vendor commands answered Unknown HCI Command here.
     pub vendor_refused: u64,
     pub acl_to_host: u64,
     pub events_to_guest: u64,

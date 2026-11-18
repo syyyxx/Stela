@@ -4,9 +4,11 @@
 //! back while the guest's queues have room. The rest wait in the host
 //! controller, as they would for a host that reads slowly.
 //!
-//! The guest is given no controller yet (`start`): macOS has not configured
-//! its USB one in any run, with a host controller or with the controller
-//! model (`stela_soc::usb::hci::model`), and its Setup waits for bluetoothd.
+//! The guest is given the controller model (`stela_soc::usb::hci::model`),
+//! presented as Apple's internal USB module, which answers inside the
+//! guest's function; a host controller is not lent yet (`start`). This
+//! reports the model's unknown commands, each once, and how many commands
+//! the guest sent, at each doubling.
 //!
 //! One controller serves the guest; others are reported and left idle. A
 //! controller that fails is reported once, and the guest's commands then get
@@ -25,16 +27,14 @@ use stela_drivers::{
     probe::native::{Bcm4377, IntelBluetooth, PcieController, PcieHci},
     usb::bluetooth::{Packet, UsbHci},
 };
-use stela_soc::machine::{AppleDevices, Outbound, UsbBluetoothCounters};
+use stela_soc::machine::{AppleDevices, Outbound, UsbBluetooth, UsbBluetoothCounters};
 
 enum Controller {
     Usb(Box<UsbHci>),
     Intel(Box<IntelBluetooth>),
     Broadcom(Box<Bcm4377>),
-    /// The guest's function answers itself; `installed` once it does.
-    Modeled {
-        installed: bool,
-    },
+    /// The guest's function answers itself.
+    Modeled,
 }
 
 /// Whether a controller took a packet, or holds it back for now.
@@ -53,6 +53,8 @@ pub struct HostBluetooth {
     failed: bool,
     /// Commands the model answered Unknown HCI Command, to report.
     unknown: Vec<u16>,
+    /// The command count reported last.
+    reported_commands: u64,
 }
 
 /// The controller is dropped in the loader's root. An install runs without
@@ -61,10 +63,7 @@ pub struct HostBluetooth {
 /// whose registers only that root maps.
 impl Drop for HostBluetooth {
     fn drop(&mut self) {
-        let controller = core::mem::replace(
-            &mut self.controller,
-            Controller::Modeled { installed: false },
-        );
+        let controller = core::mem::replace(&mut self.controller, Controller::Modeled);
         super::network::in_loader_root(self.root, || drop(controller));
     }
 }
@@ -102,24 +101,40 @@ impl HostBluetooth {
             up: None,
             failed: false,
             unknown: Vec::new(),
+            reported_commands: 0,
         })
     }
 
+    /// The controller model in the guest's function, with no host
+    /// controller behind it.
+    pub fn modeled(root: u64) -> Self {
+        Self {
+            controller: Controller::Modeled,
+            location: String::from("model"),
+            root,
+            waiting: VecDeque::new(),
+            up: None,
+            failed: false,
+            unknown: Vec::new(),
+            reported_commands: 0,
+        }
+    }
+
+    /// The guest's USB function for this controller.
+    pub fn kind(&self) -> UsbBluetooth {
+        match self.controller {
+            Controller::Modeled => UsbBluetooth::Model,
+            _ => UsbBluetooth::Host,
+        }
+    }
+
     /// What the guest queued, whether it can take more, and its status,
-    /// taken from its devices for the exchange to run without them. The
-    /// model is installed at the first exchange.
+    /// taken from its devices for the exchange to run without them.
     pub fn queued(
         &mut self,
         devices: &mut AppleDevices,
     ) -> (Vec<Outbound>, bool, Option<(bool, UsbBluetoothCounters)>) {
-        if let Controller::Modeled { installed } = &mut self.controller {
-            if !*installed && let Some(address) = devices.bluetooth_model() {
-                *installed = true;
-                let [a, b, c, d, e, f] = address;
-                output::arguments(format_args!(
-                    "BLUETOOTH model BD_ADDR {f:02x}:{e:02x}:{d:02x}:{c:02x}:{b:02x}:{a:02x}\n"
-                ));
-            }
+        if matches!(self.controller, Controller::Modeled) {
             self.unknown.extend(devices.bluetooth_unknown());
         }
         let packets = core::iter::from_fn(|| devices.bluetooth_take()).collect();
@@ -150,6 +165,16 @@ impl HostBluetooth {
             ));
         }
         let (up, counters) = status.unwrap_or_default();
+        if matches!(self.controller, Controller::Modeled)
+            && counters.commands > 0
+            && counters.commands >= 2 * self.reported_commands
+        {
+            self.reported_commands = counters.commands;
+            output::arguments(format_args!(
+                "GUEST BLUETOOTH commands={} unknown={}\n",
+                counters.commands, counters.unknown
+            ));
+        }
         if self.up != Some(up) {
             self.up = Some(up);
             output::arguments(format_args!(
@@ -161,7 +186,7 @@ impl HostBluetooth {
 
     pub fn transmit(&mut self, packets: Vec<Outbound>) {
         // The model answers inside the guest's function.
-        if self.failed || matches!(self.controller, Controller::Modeled { .. }) {
+        if self.failed || matches!(self.controller, Controller::Modeled) {
             return;
         }
         self.waiting.extend(packets);
@@ -194,7 +219,7 @@ impl HostBluetooth {
                         Ok(Sent::Busy)
                     }
                 }
-                (Controller::Modeled { .. }, _) => Ok(Sent::Taken),
+                (Controller::Modeled, _) => Ok(Sent::Taken),
                 (Controller::Broadcom(transport), packet) => {
                     let (kind, bytes) = match packet {
                         Outbound::Command(bytes) => (bcm4377::Kind::Command, bytes),
@@ -219,7 +244,7 @@ impl HostBluetooth {
 
     /// What the controller has for the guest.
     pub fn receive(&mut self) -> Vec<Packet> {
-        if self.failed || matches!(self.controller, Controller::Modeled { .. }) {
+        if self.failed || matches!(self.controller, Controller::Modeled) {
             return Vec::new();
         }
         // SAFETY: as in `transmit`.
@@ -227,7 +252,7 @@ impl HostBluetooth {
             return Vec::new();
         };
         let received = match &mut self.controller {
-            Controller::Modeled { .. } => Ok(Vec::new()),
+            Controller::Modeled => Ok(Vec::new()),
             Controller::Usb(hci) => hci.poll().map_err(|error| alloc::format!("{error}")),
             Controller::Intel(transport) => transport
                 .poll()
