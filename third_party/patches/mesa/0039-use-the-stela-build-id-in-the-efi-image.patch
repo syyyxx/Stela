@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Wed, 18 Nov 2026 19:06:00 +0800
+Subject: [PATCH] mesa: use Stela's static build ID without dladdr
+
+RADV requires a build ID to create its device UUID even with the disk
+shader cache disabled. In the EFI build HAVE_DLADDR is absent, so Mesa's
+fallback returns false and RADV refuses the device. Feed the ID that
+Stela's existing Mesa shim supplies into the hash directly. Hosted Mesa
+keeps its normal lookup.
+---
+diff --git a/src/util/disk_cache.h b/src/util/disk_cache.h
+index 94681b7..f634e37 100644
+--- a/src/util/disk_cache.h
++++ b/src/util/disk_cache.h
+@@ -27,6 +27,8 @@
+ #ifdef HAVE_DLFCN_H
+ #include <dlfcn.h>
+ #include <stdio.h>
++#endif
++#if defined(HAVE_DLFCN_H) || defined(STELA_LIBC)
+ #include "util/build_id.h"
+ #endif
+ #include <assert.h>
+@@ -79,7 +81,19 @@ struct cache_item_metadata {
+ 
+ struct disk_cache;
+ 
+-#ifdef HAVE_DLADDR
++#ifdef STELA_LIBC
++/* Mesa is linked into the EFI image, where dladdr is unavailable. */
++static inline bool
++disk_cache_get_function_identifier(void *ptr, blake3_hasher *ctx)
++{
++   const struct build_id_note *note = build_id_find_nhdr_for_addr(ptr);
++   if (!note)
++      return false;
++
++   _mesa_blake3_update(ctx, build_id_data(note), build_id_length(note));
++   return true;
++}
++#elif defined(HAVE_DLADDR)
+ static inline bool
+ disk_cache_get_function_timestamp(void *ptr, uint32_t* timestamp)
+ {
